@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "ReplayX",
+  "version": "1.0",
+  "description": "Deterministic session recorder and replay tool",
+  "permissions": [
+    "storage",
+    "scripting",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "action": {
+    "default_popup": "index.html",
+    "default_title": "ReplayX"
+  },
+  "background": {
+    "service_worker": "src/background/service_worker.ts",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/content/main.ts"],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["src/content/interceptor.ts"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
