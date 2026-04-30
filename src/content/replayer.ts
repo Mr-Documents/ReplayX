@@ -22,10 +22,24 @@ export class Replayer {
 
     // Simulate events sequentially based on timestamp
     const domEvents = session.events.filter(e => e.type === 'Click' || e.type === 'Input');
+    const networkEvents = session.events.filter(e => e.type === 'Network');
+    
+    console.log(`[ReplayX] Found ${domEvents.length} DOM events and ${networkEvents.length} network events`);
+    
+    if (domEvents.length === 0 && networkEvents.length === 0) {
+      console.log('[ReplayX] No events to replay');
+      alert('ReplayX: No events were recorded in this session.');
+      this.finishReplay();
+      return;
+    }
     
     if (domEvents.length === 0) {
-      console.log('[ReplayX] No DOM events to replay');
-      this.finishReplay();
+      console.log('[ReplayX] Only network events found - network mocking is active');
+      // Show a brief message then finish - network events are handled by interceptor
+      setTimeout(() => {
+        console.log('[ReplayX] Network replay complete');
+        this.finishReplay();
+      }, 2000);
       return;
     }
 
@@ -94,32 +108,98 @@ export class Replayer {
 
   private async dispatchDOMEvent(ev: RecordedEvent) {
       if (ev.type === 'Click') {
-          const el = document.querySelector(ev.selector) as HTMLElement;
+          let el = document.querySelector(ev.selector) as HTMLElement;
+          
+          // Try alternative selectors if primary fails
+          if (!el) {
+            el = this.tryAlternativeSelectors(ev.selector);
+          }
+          
           if (el) {
+              console.log('[ReplayX] Clicking element:', ev.selector);
               el.scrollIntoView({ behavior: 'smooth', block: 'center' });
               await this.delayMs(300); // Wait for scroll
               this.moveCursorTo(el);
               await this.delayMs(300); // Wait for cursor move
-              el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
-              el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
-              el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+              
+              // Ensure element is visible and enabled
+              if (this.isElementInteractable(el)) {
+                  el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+                  await this.delayMs(50);
+                  el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+                  await this.delayMs(50);
+                  el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+              } else {
+                  console.warn('[ReplayX] Element not interactable:', ev.selector);
+              }
           } else {
               console.warn('[ReplayX Replayer] Click target not found:', ev.selector);
           }
       } else if (ev.type === 'Input') {
-          const el = document.querySelector(ev.selector) as HTMLInputElement;
+          let el = document.querySelector(ev.selector) as HTMLInputElement;
+          
+          // Try alternative selectors if primary fails
+          if (!el) {
+            el = this.tryAlternativeSelectors(ev.selector) as HTMLInputElement;
+          }
+          
           if (el) {
+              console.log('[ReplayX] Inputting into element:', ev.selector);
               el.scrollIntoView({ behavior: 'smooth', block: 'center' });
               await this.delayMs(300);
               this.moveCursorTo(el);
               await this.delayMs(300);
-              el.value = ev.value || '';
-              el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-              el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+              
+              if (this.isElementInteractable(el)) {
+                  el.value = ev.value || '';
+                  el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+                  await this.delayMs(100);
+                  el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+              } else {
+                  console.warn('[ReplayX] Input element not interactable:', ev.selector);
+              }
           } else {
               console.warn('[ReplayX Replayer] Input target not found:', ev.selector);
           }
       }
+  }
+
+  private tryAlternativeSelectors(originalSelector: string): HTMLElement | null {
+    // Try to find element by text content if it's a button/link
+    if (originalSelector.includes('button') || originalSelector.includes('a')) {
+      const elements = Array.from(document.querySelectorAll('button, a'));
+      for (const el of elements) {
+        if (el.textContent && el.textContent.trim().length > 0) {
+          return el as HTMLElement;
+        }
+      }
+    }
+    
+    // Try simplified selector (just tag name and classes)
+    const parts = originalSelector.split(' > ');
+    const lastPart = parts[parts.length - 1];
+    const simpleSelector = lastPart.split(':')[0]; // Remove nth-of-type
+    
+    const el = document.querySelector(simpleSelector);
+    if (el) return el as HTMLElement;
+    
+    // Try to find by ID if selector contains one
+    const idMatch = originalSelector.match(/#([^ >]+)/);
+    if (idMatch) {
+      const idEl = document.getElementById(idMatch[1]);
+      if (idEl) return idEl;
+    }
+    
+    return null;
+  }
+
+  private isElementInteractable(el: HTMLElement): boolean {
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && 
+           style.visibility !== 'hidden' && 
+           !el.hasAttribute('disabled') &&
+           el.offsetWidth > 0 && 
+           el.offsetHeight > 0;
   }
 
   private delayMs(ms: number) {

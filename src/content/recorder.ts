@@ -64,24 +64,71 @@ export class Recorder {
 
   private getSelector(el: HTMLElement): string {
     if (el.tagName.toLowerCase() === 'html') return 'html';
-    let path = [];
-    while (el.nodeType === Node.ELEMENT_NODE) {
-      let selector = el.nodeName.toLowerCase();
-      if (el.id) {
-        selector += '#' + el.id;
-        path.unshift(selector);
-        break; // IDs are unique, can stop traversing
-      } else {
-        let sibling = el, nth = 1;
-        while (sibling = sibling.previousElementSibling as HTMLElement) {
-          if (sibling.nodeName.toLowerCase() == selector) nth++;
-        }
-        if (nth != 1) selector += `:nth-of-type(${nth})`;
-      }
-      path.unshift(selector);
-      el = el.parentNode as HTMLElement;
-      if (!el || el.tagName.toLowerCase() === 'html') break;
+    
+    // Try ID first - most reliable
+    if (el.id) {
+      return `#${el.id}`;
     }
-    return path.join(' > ');
+    
+    // Try data attributes if present
+    if (el.getAttribute('data-testid')) {
+      return `[data-testid="${el.getAttribute('data-testid')}"]`;
+    }
+    
+    if (el.getAttribute('data-cy')) {
+      return `[data-cy="${el.getAttribute('data-cy')}"]`;
+    }
+    
+    // Generate path-based selector as fallback
+    let path = [];
+    let currentEl = el;
+    
+    while (currentEl && currentEl.nodeType === Node.ELEMENT_NODE) {
+      let selector = currentEl.nodeName.toLowerCase();
+      
+      // Add classes if they seem stable (not utility classes)
+      if (currentEl.className) {
+        const classes = currentEl.className.split(' ').filter(cls => 
+          cls && !cls.includes('hover') && !cls.includes('active') && 
+          cls.length > 2 && !cls.match(/^\d+$/)
+        );
+        if (classes.length > 0 && classes.length <= 3) {
+          selector += '.' + classes.join('.');
+        }
+      }
+      
+      // Add nth-of-type for disambiguation
+      if (!currentEl.id) {
+        let sibling = currentEl, nth = 1;
+        while (sibling = sibling.previousElementSibling as HTMLElement) {
+          if (sibling.nodeName.toLowerCase() === selector.split('.')[0]) nth++;
+        }
+        if (nth > 1) selector += `:nth-of-type(${nth})`;
+      }
+      
+      path.unshift(selector);
+      currentEl = currentEl.parentNode as HTMLElement;
+      
+      // Stop at body to keep selectors reasonable
+      if (!currentEl || currentEl.tagName.toLowerCase() === 'body') break;
+    }
+    
+    const fullSelector = path.join(' > ');
+    
+    // If selector is too long, try a shorter version
+    if (fullSelector.length > 100) {
+      // Try just the element with classes and nth-of-type
+      const simpleSelector = el.nodeName.toLowerCase();
+      const classes = el.className.split(' ').filter(cls => 
+        cls && !cls.includes('hover') && !cls.includes('active') && 
+        cls.length > 2 && !cls.match(/^\d+$/)
+      );
+      if (classes.length > 0) {
+        return simpleSelector + '.' + classes.join('.');
+      }
+      return simpleSelector;
+    }
+    
+    return fullSelector;
   }
 }

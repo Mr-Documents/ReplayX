@@ -66,6 +66,11 @@ chrome.runtime.sendMessage({ action: 'GET_STATE' }, (state) => {
   if (state && state.isRecording) {
     console.log('[ReplayX] Resuming recording after refresh');
     startRecordingState();
+  } else if (state && state.activeReplaySession) {
+    console.log('[ReplayX] Automatically starting replay after navigation');
+    createWidget();
+    updateWidgetState(false);
+    replayer.start(state.activeReplaySession);
   } else {
     createWidget();
     updateWidgetState(false);
@@ -115,13 +120,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     
   } else if (message.action === 'START_REPLAY') {
     const session: SessionData = message.session;
-    if (window.location.href !== session.url) {
-       console.log('[ReplayX] Navigating to initial URL before replay...');
-       window.location.href = session.url;
-       sendResponse({ success: true, navigating: true });
-       return;
-    }
-    
     replayer.start(session);
     sendResponse({ success: true });
   }

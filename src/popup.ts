@@ -38,10 +38,22 @@ function renderSessions(sessions: SessionData[]) {
     const date = new Date(session.startTime).toLocaleString();
     const eventCount = session.events.length;
     
+    let displayUrl = session.url;
+    try {
+      if (session.url) {
+        displayUrl = new URL(session.url).pathname;
+        if (displayUrl === '/') displayUrl = new URL(session.url).hostname;
+      } else {
+        displayUrl = 'Unknown URL';
+      }
+    } catch (e) {
+      // Keep original string if invalid URL
+    }
+    
     el.innerHTML = `
       <div class="session-info">
         <strong>${date}</strong><br>
-        URL: ${new URL(session.url).pathname}<br>
+        URL: ${displayUrl}<br>
         Events: ${eventCount}
       </div>
       <button class="replay-btn" data-id="${session.id}">Replay Session</button>
