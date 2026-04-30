@@ -9,6 +9,20 @@ let recordingState = {
   startTime: 0
 };
 
+let activeReplaySession: SessionData | null = null;
+let replayTabId: number | null = null;
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (tabId === replayTabId && changeInfo.status === 'complete' && activeReplaySession) {
+    // Give the page a slight delay to initialize scripts
+    setTimeout(() => {
+      if (activeReplaySession) {
+        chrome.tabs.sendMessage(tabId, { action: 'START_REPLAY', session: activeReplaySession });
+      }
+    }, 500);
+  }
+});
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'GET_STATE') {
     sendResponse({ isRecording, currentTabId });
@@ -60,17 +74,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
             const tab = tabs[0];
             if (tab.id) {
+                activeReplaySession = session;
+                replayTabId = tab.id;
                 chrome.tabs.sendMessage(tab.id, { action: 'START_REPLAY', session }, (res) => {
-                     if (res && res.navigating) {
-                         // Tab is redirecting to initial url. We need to wait for loaded.
-                         // For MVP, we can listen for tab update, but it's simpler to instruct user in UI.
-                         // A full implementation would use chrome.tabs.onUpdated to inject REPLAY instantly upon load.
-                     }
                      sendResponse({ success: true });
                 });
             }
         });
     });
     return true;
+  } else if (message.action === 'REPLAY_FINISHED') {
+    activeReplaySession = null;
+    replayTabId = null;
   }
 });
