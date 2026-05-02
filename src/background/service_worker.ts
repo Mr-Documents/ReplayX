@@ -1,130 +1,471 @@
-import { saveSession, getSessions, getSession } from '../storage/db';
+import { saveSession, getSessions, getSession, deleteSession } from '../storage/db';
 import { SessionData, RecordedEvent } from '../types';
 
+// Recording state
 let isRecording = false;
 let currentTabId: number | null = null;
-let currentRecordingEvents: RecordedEvent[] = [];
-let recordingState = {
-  url: '',
-  startTime: 0
-};
+let currentSessionId: string | null = null;
+let recordingStartTime: number = 0;
 
+// Replay state
 let activeReplaySession: SessionData | null = null;
 let replayTabId: number | null = null;
+let replaySpeed = 1;
 
+// Session lifecycle management
+const sessionStates = new Map<string, {
+  status: 'recording' | 'paused' | 'completed' | 'replaying';
+  tabId: number;
+  startTime: number;
+  events: RecordedEvent[];
+}>();
+
+// Tab lifecycle listeners
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  // Check if tab finished loading and we have an active replay session
+  // Handle navigation during replay
   if (changeInfo.status === 'complete' && tabId === replayTabId && activeReplaySession) {
-    console.log('[ReplayX] Tab navigation complete, starting replay');
-    chrome.tabs.sendMessage(tabId, { action: 'START_REPLAY', session: activeReplaySession }, (res) => {
+    console.log('[ReplayX BG] Tab navigation complete, starting replay');
+    chrome.tabs.sendMessage(tabId, {
+      action: 'START_REPLAY',
+      session: activeReplaySession,
+      speed: replaySpeed
+    }, (res) => {
       if (chrome.runtime.lastError) {
-        console.error('[ReplayX] Auto-replay start error:', chrome.runtime.lastError.message);
+        console.error('[ReplayX BG] Auto-replay start error:', chrome.runtime.lastError.message);
       }
     });
   }
+
+  // Handle tab close during recording/replay
+  if (changeInfo.status === 'complete' && !tab) {
+    cleanupTabState(tabId);
+  }
 });
 
+chrome.tabs.onRemoved.addListener((tabId) => {
+  cleanupTabState(tabId);
+});
+
+// Message handling
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.action === 'GET_STATE') {
-    sendResponse({ 
-      isRecording, 
-      currentTabId,
-      activeReplaySession: (replayTabId && sender.tab && replayTabId === sender.tab.id) ? activeReplaySession : null
-    });
-  } else if (message.action === 'START_RECORDING') {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      const tab = tabs[0];
-      if (tab && tab.id) {
-        currentTabId = tab.id;
-        isRecording = true;
-        chrome.tabs.sendMessage(tab.id, { action: 'START_RECORD' }, (response) => {
-            if (chrome.runtime.lastError) {
-                isRecording = false;
-                sendResponse({ success: false, error: chrome.runtime.lastError.message });
-                return;
-            }
-            if (response && response.success) {
-                recordingState.url = response.url;
-                recordingState.startTime = response.startTime;
-                sendResponse({ success: true });
-            } else {
-                isRecording = false;
-                sendResponse({ success: false, error: 'Could not communicate with tab' });
-            }
-        });
-      } else {
-        sendResponse({ success: false, error: 'No active tab found' });
-      }
-    });
-    return true; // async
-  } else if (message.action === 'STOP_RECORDING') {
-    if (currentTabId) {
-      chrome.tabs.sendMessage(currentTabId, { action: 'STOP_RECORD' }, async (response) => {
-        if (chrome.runtime.lastError) {
-            console.error('Stop recording error:', chrome.runtime.lastError.message);
-        }
+  const tabId = sender.tab?.id;
+
+  switch (message.action) {
+    case 'GET_STATE': {
+      // If called from popup (no tabId), return global state
+      // If called from content script, return tab-specific state
+      const isFromPopup = !tabId;
+      const isCurrentTabRecording = tabId !== undefined && tabId === currentTabId;
+
+      sendResponse({
+        isRecording: isFromPopup ? isRecording : (isCurrentTabRecording ? isRecording : false),
+        currentSessionId: isFromPopup ? currentSessionId : (isCurrentTabRecording ? currentSessionId : null),
+        recordingStartTime: isFromPopup ? recordingStartTime : (isCurrentTabRecording ? recordingStartTime : null),
+        currentTabId: isFromPopup ? currentTabId : (isCurrentTabRecording ? currentTabId : null),
+        activeReplaySession: (replayTabId && tabId === replayTabId) ? activeReplaySession : null,
+        replaySpeed
+      });
+      break;
+    }
+
+    case 'SAVE_RECORDING_EVENTS':
+      handleSaveRecordingEvents(message.sessionId, message.events, sendResponse);
+      return true;
+
+    case 'START_RECORDING':
+      handleStartRecording(sendResponse);
+      return true; // async
+
+    case 'STOP_RECORDING':
+      handleStopRecording(sendResponse);
+      return true; // async
+
+    case 'PAUSE_RECORDING':
+      if (isRecording && currentSessionId) {
+        sessionStates.get(currentSessionId)!.status = 'paused';
         isRecording = false;
-        if (response && response.success) {
-          const session: SessionData = {
-            id: crypto.randomUUID(),
-            url: recordingState.url,
-            startTime: response.startTime,
-            events: response.events
-          };
-          await saveSession(session);
-          sendResponse({ success: true });
-        } else {
-          sendResponse({ success: false });
-        }
+        sendResponse({ success: true });
+      } else {
+        sendResponse({ success: false, error: 'Not recording' });
+      }
+      break;
+
+    case 'RESUME_RECORDING':
+      if (!isRecording && currentSessionId && sessionStates.get(currentSessionId)?.status === 'paused') {
+        sessionStates.get(currentSessionId)!.status = 'recording';
+        isRecording = true;
+        sendResponse({ success: true });
+      } else {
+        sendResponse({ success: false, error: 'Cannot resume' });
+      }
+      break;
+
+    case 'GET_SESSIONS':
+      getSessions().then(sessions => sendResponse({ sessions })).catch(error => {
+        console.error('[ReplayX BG] Error getting sessions:', error);
+        sendResponse({ sessions: [], error: error.message });
       });
       return true; // async
-    } else {
-      sendResponse({ success: false });
-    }
-  } else if (message.action === 'GET_SESSIONS') {
-    getSessions().then(sessions => sendResponse({ sessions }));
-    return true; // async
-  } else if (message.action === 'REPLAY_SESSION') {
-    const sessionId = message.sessionId;
-    getSession(sessionId).then(session => {
-        if (!session) return sendResponse({ success: false });
-        
-        chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-            const tab = tabs[0];
-            if (tab && tab.id) {
-                activeReplaySession = session;
-                replayTabId = tab.id;
-                
-                // Compare URLs safely, ignore trailing slashes or hashes for basic match if needed, but strict is fine for now
-                let tabUrlObj, sessionUrlObj;
-                try {
-                   tabUrlObj = new URL(tab.url || '');
-                   sessionUrlObj = new URL(session.url);
-                } catch(e) {}
 
-                // If completely different origin or pathname, navigate
-                if (tabUrlObj && sessionUrlObj && (tabUrlObj.origin !== sessionUrlObj.origin || tabUrlObj.pathname !== sessionUrlObj.pathname)) {
-                     chrome.tabs.update(tab.id, { url: session.url }, () => {
-                         // Navigation started, but we need to wait for it to complete
-                         // The content script will check for activeReplaySession and auto-start
-                         sendResponse({ success: true });
-                     });
-                } else {
-                    chrome.tabs.sendMessage(tab.id, { action: 'START_REPLAY', session }, (res) => {
-                         if (chrome.runtime.lastError) {
-                             console.error('Replay start error:', chrome.runtime.lastError.message);
-                         }
-                         sendResponse({ success: true });
-                    });
-                }
-            } else {
-                sendResponse({ success: false });
-            }
-        });
+    case 'REPLAY_SESSION':
+      handleReplaySession(message.sessionId, message.speed || 1, sendResponse);
+      return true; // async
+
+    case 'STOP_REPLAY':
+      handleStopReplay(sendResponse);
+      break;
+
+    case 'SET_REPLAY_SPEED':
+      replaySpeed = Math.max(0.1, Math.min(10, message.speed || 1));
+      if (replayTabId) {
+        chrome.tabs.sendMessage(replayTabId, { action: 'SET_REPLAY_SPEED', speed: replaySpeed });
+      }
+      sendResponse({ success: true });
+      break;
+
+    case 'DELETE_SESSION':
+      deleteSession(message.sessionId).then(() => sendResponse({ success: true })).catch(error => {
+        console.error('[ReplayX BG] Error deleting session:', error);
+        sendResponse({ success: false, error: error.message });
+      });
+      return true; // async
+
+    case 'EXPORT_SESSION':
+      handleExportSession(message.sessionId, sendResponse);
+      return true; // async
+
+    case 'IMPORT_SESSION':
+      handleImportSession(message.sessionData, sendResponse);
+      return true; // async
+
+    case 'REPLAY_FINISHED':
+      console.log('[ReplayX BG] Replay finished');
+      activeReplaySession = null;
+      replayTabId = null;
+      sendResponse({ success: true });
+      break;
+
+    default:
+      sendResponse({ success: false, error: 'Unknown action' });
+  }
+});
+
+// Recording handlers
+function getContentScriptPath() {
+  const manifest = chrome.runtime.getManifest();
+  if (!manifest.content_scripts) return null;
+
+  const mainScript = manifest.content_scripts
+    .flatMap((entry: any) => entry.js || [])
+    .find((path: string) => path.includes('main')); 
+
+  return mainScript || null;
+}
+
+async function ensureContentScript(tabId: number) {
+  const scriptPath = getContentScriptPath();
+  if (!scriptPath) {
+    console.warn('[ReplayX BG] Cannot resolve content script path from manifest');
+    return;
+  }
+
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: [scriptPath]
     });
-    return true;
-  } else if (message.action === 'REPLAY_FINISHED') {
+  } catch (error) {
+    console.warn('[ReplayX BG] Could not inject main content script:', error);
+  }
+}
+
+async function sendMessageToTab(tabId: number, message: any): Promise<any> {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, message, (response) => {
+      if (chrome.runtime.lastError) {
+        resolve({ error: chrome.runtime.lastError.message });
+        return;
+      }
+      resolve(response);
+    });
+  });
+}
+
+async function handleStartRecording(sendResponse: (response: any) => void) {
+  if (isRecording) {
+    sendResponse({ success: false, error: 'Already recording' });
+    return;
+  }
+
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  const tab = tabs[0];
+
+  if (!tab?.id) {
+    sendResponse({ success: false, error: 'No active tab found' });
+    return;
+  }
+
+  if (!tab.url || !tab.url.startsWith('http')) {
+    sendResponse({ success: false, error: 'Cannot record this tab type' });
+    return;
+  }
+
+  try {
+    currentSessionId = crypto.randomUUID();
+    currentTabId = tab.id;
+    isRecording = true;
+    recordingStartTime = Date.now();
+
+    sessionStates.set(currentSessionId, {
+      status: 'recording',
+      tabId: tab.id,
+      startTime: recordingStartTime,
+      events: []
+    });
+
+    let response = await sendMessageToTab(tab.id, {
+      action: 'START_RECORD',
+      sessionId: currentSessionId
+    });
+
+    if (response?.error && response.error.includes('Receiving end does not exist')) {
+      await ensureContentScript(tab.id);
+      response = await sendMessageToTab(tab.id, {
+        action: 'START_RECORD',
+        sessionId: currentSessionId
+      });
+    }
+
+    if (response?.error) {
+      console.error('[ReplayX BG] Start recording error:', response.error);
+      cleanupRecording();
+      sendResponse({ success: false, error: response.error });
+      return;
+    }
+
+    if (response?.success) {
+      console.log('[ReplayX BG] Recording started for session:', currentSessionId);
+      sendResponse({ success: true, sessionId: currentSessionId });
+    } else {
+      cleanupRecording();
+      sendResponse({ success: false, error: 'Content script failed to start' });
+    }
+  } catch (error) {
+    console.error('[ReplayX BG] Error starting recording:', error);
+    cleanupRecording();
+    sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
+  }
+}
+
+async function handleStopRecording(sendResponse: (response: any) => void) {
+  if (!isRecording || !currentTabId || !currentSessionId) {
+    sendResponse({ success: false, error: 'Not recording' });
+    return;
+  }
+
+  try {
+    const response = await chrome.tabs.sendMessage(currentTabId, { action: 'STOP_RECORD' });
+
+    if (response?.success) {
+      const sessionState = sessionStates.get(currentSessionId);
+      if (sessionState) {
+        sessionState.status = 'completed';
+        sessionState.events = sessionState.events.concat(response.events || []);
+
+        const mergedEvents = sessionState.events;
+
+        // Create session data
+        const session: SessionData = {
+          id: currentSessionId,
+          url: response.url || 'unknown',
+          startTime: sessionState.startTime,
+          events: mergedEvents,
+          metadata: {
+            userAgent: navigator.userAgent,
+            viewport: response.viewport || { width: 0, height: 0 },
+            totalEvents: mergedEvents.length,
+            duration: mergedEvents.length > 0 ? Math.max(...mergedEvents.map((e: RecordedEvent) => e.timestamp)) -
+                     Math.min(...mergedEvents.map((e: RecordedEvent) => e.timestamp)) : 0
+          }
+        };
+
+        await saveSession(session);
+        console.log('[ReplayX BG] Session saved:', currentSessionId);
+        sendResponse({ success: true, sessionId: currentSessionId });
+      } else {
+        sendResponse({ success: false, error: 'Session state not found' });
+      }
+    } else {
+      sendResponse({ success: false, error: 'Content script failed to stop' });
+    }
+  } catch (error) {
+    console.error('[ReplayX BG] Error stopping recording:', error);
+    sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
+  } finally {
+    cleanupRecording();
+  }
+}
+
+function handleSaveRecordingEvents(sessionId: string, events: RecordedEvent[], sendResponse: (response: any) => void) {
+  if (!sessionId || !sessionStates.has(sessionId)) {
+    sendResponse({ success: false, error: 'Session not found' });
+    return;
+  }
+
+  const sessionState = sessionStates.get(sessionId)!;
+  sessionState.events = sessionState.events.concat(events || []);
+  console.log('[ReplayX BG] Flushed events for recording session:', sessionId, 'count:', events.length);
+  sendResponse({ success: true });
+}
+
+// Replay handlers
+async function handleReplaySession(sessionId: string, speed: number, sendResponse: (response: any) => void) {
+  if (activeReplaySession) {
+    sendResponse({ success: false, error: 'Replay already in progress' });
+    return;
+  }
+
+  try {
+    const session = await getSession(sessionId);
+    if (!session) {
+      sendResponse({ success: false, error: 'Session not found' });
+      return;
+    }
+
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const tab = tabs[0];
+
+    if (!tab?.id) {
+      sendResponse({ success: false, error: 'No active tab found' });
+      return;
+    }
+
+    activeReplaySession = session;
+    replayTabId = tab.id;
+    replaySpeed = speed;
+
+    // Check if we need to navigate
+    const currentUrl = new URL(tab.url || '');
+    const sessionUrl = new URL(session.url);
+
+    if (currentUrl.origin !== sessionUrl.origin || currentUrl.pathname !== sessionUrl.pathname) {
+      // Navigate to session URL
+      await chrome.tabs.update(tab.id, { url: session.url });
+      // Replay will start automatically via tabs.onUpdated listener
+      sendResponse({ success: true });
+    } else {
+      // Start replay immediately
+      chrome.tabs.sendMessage(tab.id, {
+        action: 'START_REPLAY',
+        session,
+        speed
+      }, (res) => {
+        if (chrome.runtime.lastError) {
+          console.error('[ReplayX BG] Replay start error:', chrome.runtime.lastError.message);
+          activeReplaySession = null;
+          replayTabId = null;
+          sendResponse({ success: false, error: chrome.runtime.lastError.message });
+        } else {
+          sendResponse({ success: true });
+        }
+      });
+    }
+  } catch (error) {
+    console.error('[ReplayX BG] Error starting replay:', error);
+    activeReplaySession = null;
+    replayTabId = null;
+    sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
+  }
+}
+
+function handleStopReplay(sendResponse: (response: any) => void) {
+  if (replayTabId) {
+    chrome.tabs.sendMessage(replayTabId, { action: 'STOP_REPLAY' }, () => {
+      activeReplaySession = null;
+      replayTabId = null;
+      sendResponse({ success: true });
+    });
+  } else {
+    sendResponse({ success: false, error: 'No active replay' });
+  }
+}
+
+// Session management
+async function handleExportSession(sessionId: string, sendResponse: (response: any) => void) {
+  try {
+    const session = await getSession(sessionId);
+    if (!session) {
+      sendResponse({ success: false, error: 'Session not found' });
+      return;
+    }
+
+    const dataStr = JSON.stringify(session, null, 2);
+    const dataBlob = new Blob([dataStr], { type: 'application/json' });
+
+    // Create download
+    const url = URL.createObjectURL(dataBlob);
+    await chrome.downloads.download({
+      url,
+      filename: `replayx-session-${sessionId}.json`,
+      saveAs: true
+    });
+
+    URL.revokeObjectURL(url);
+    sendResponse({ success: true });
+  } catch (error) {
+    console.error('[ReplayX BG] Error exporting session:', error);
+    sendResponse({ success: false, error: error instanceof Error ? error.message : 'Export failed' });
+  }
+}
+
+async function handleImportSession(sessionData: SessionData, sendResponse: (response: any) => void) {
+  try {
+    // Validate session data
+    if (!sessionData.id || !sessionData.events || !Array.isArray(sessionData.events)) {
+      sendResponse({ success: false, error: 'Invalid session data' });
+      return;
+    }
+
+    await saveSession(sessionData);
+    sendResponse({ success: true, sessionId: sessionData.id });
+  } catch (error) {
+    console.error('[ReplayX BG] Error importing session:', error);
+    sendResponse({ success: false, error: error instanceof Error ? error.message : 'Import failed' });
+  }
+}
+
+// Utility functions
+function cleanupRecording() {
+  isRecording = false;
+  currentTabId = null;
+  currentSessionId = null;
+  recordingStartTime = 0;
+}
+
+function cleanupTabState(tabId: number) {
+  if (currentTabId === tabId) {
+    cleanupRecording();
+  }
+  if (replayTabId === tabId) {
     activeReplaySession = null;
     replayTabId = null;
   }
-});
+
+  // Clean up session states
+  for (const [sessionId, state] of sessionStates) {
+    if (state.tabId === tabId) {
+      sessionStates.delete(sessionId);
+    }
+  }
+}
+
+// Periodic cleanup
+setInterval(() => {
+  // Clean up old completed sessions from memory
+  const now = Date.now();
+  for (const [sessionId, state] of sessionStates) {
+    if (state.status === 'completed' && now - state.startTime > 3600000) { // 1 hour
+      sessionStates.delete(sessionId);
+    }
+  }
+}, 300000); // 5 minutes

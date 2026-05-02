@@ -39,15 +39,20 @@ function createWidget() {
   document.body.appendChild(widget);
 
   widget.addEventListener('click', () => {
-     // Optional: could toggle recording from here, or just open popup.
+    // Optional: could toggle recording from here, or just open popup.
   });
 }
 
-function updateWidgetState(isRecording: boolean) {
+function updateWidgetState(isRecording: boolean, isReplaying: boolean = false) {
   if (!widget) createWidget();
   const icon = document.getElementById('replayx-icon-dot');
   if (icon && widget) {
-    if (isRecording) {
+    if (isReplaying) {
+      icon.style.backgroundColor = '#38a169'; // Green for replaying
+      icon.style.boxShadow = '0 0 8px #38a169';
+      widget.title = 'ReplayX - Replaying';
+      widget.style.border = '2px solid #38a169';
+    } else if (isRecording) {
       icon.style.backgroundColor = '#e53e3e'; // Red for recording
       icon.style.boxShadow = '0 0 8px #e53e3e';
       widget.title = 'ReplayX - Recording';
@@ -61,66 +66,157 @@ function updateWidgetState(isRecording: boolean) {
   }
 }
 
-// Check initial state from background in case of page refresh
+// Check initial state from background in case of page refresh or navigation
 chrome.runtime.sendMessage({ action: 'GET_STATE' }, (state) => {
-  if (state && state.isRecording) {
-    console.log('[ReplayX] Resuming recording after refresh');
-    startRecordingState();
-  } else if (state && state.activeReplaySession) {
+  createWidget();
+
+  if (state?.isRecording && state?.currentSessionId) {
+    console.log('[ReplayX] Resuming recording after navigation or refresh');
+    recorder.start(state.currentSessionId, state.recordingStartTime);
+    updateWidgetState(true);
+  } else if (state?.activeReplaySession) {
     console.log('[ReplayX] Automatically starting replay after navigation');
-    createWidget();
-    updateWidgetState(false);
-    replayer.start(state.activeReplaySession);
+    updateWidgetState(false, true);
+    replayer.start(state.activeReplaySession, { speed: state.replaySpeed || 1 });
   } else {
-    createWidget();
     updateWidgetState(false);
   }
 });
 
-function startRecordingState() {
-  recorder.start();
-  updateWidgetState(true);
-  window.postMessage({
-    source: 'replayx-content',
-    action: 'SET_MODE',
-    mode: 'RECORD'
-  }, '*');
+// Message handlers
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  switch (message.action) {
+    case 'START_RECORD':
+      try {
+        recorder.start(message.sessionId);
+        updateWidgetState(true);
+        sendResponse({
+          success: true,
+          url: window.location.href,
+          startTime: Date.now()
+        });
+      } catch (error) {
+        console.error('[ReplayX] Error starting recording:', error);
+        sendResponse({ success: false, error: error.message });
+      }
+      break;
+
+    case 'STOP_RECORD':
+      try {
+        const result = recorder.stop();
+        updateWidgetState(false);
+        sendResponse({
+          success: true,
+          events: result.events,
+          startTime: result.startTime,
+          url: window.location.href,
+          viewport: { width: window.innerWidth, height: window.innerHeight }
+        });
+      } catch (error) {
+        console.error('[ReplayX] Error stopping recording:', error);
+        sendResponse({ success: false, error: error.message });
+      }
+      break;
+
+    case 'START_REPLAY':
+      try {
+        updateWidgetState(false, true);
+        replayer.start(message.session, { speed: message.speed || 1 });
+        sendResponse({ success: true });
+      } catch (error) {
+        console.error('[ReplayX] Error starting replay:', error);
+        updateWidgetState(false);
+        sendResponse({ success: false, error: error.message });
+      }
+      break;
+
+    case 'STOP_REPLAY':
+      try {
+        replayer.stop();
+        updateWidgetState(false);
+        sendResponse({ success: true });
+      } catch (error) {
+        console.error('[ReplayX] Error stopping replay:', error);
+        sendResponse({ success: false, error: error.message });
+      }
+      break;
+
+    case 'SET_REPLAY_SPEED':
+      try {
+        replayer.setSpeed(message.speed);
+        sendResponse({ success: true });
+      } catch (error) {
+        console.error('[ReplayX] Error setting replay speed:', error);
+        sendResponse({ success: false, error: error.message });
+      }
+      break;
+
+    default:
+      sendResponse({ success: false, error: 'Unknown action' });
+  }
+});
+
+// Handle network events from interceptor
+window.addEventListener('message', (event) => {
+  if (event.data && event.data.source === 'replayx-interceptor' && event.data.type === 'Network') {
+    // Forward network events to recorder
+    recorder.addEvent({
+      id: crypto.randomUUID(),
+      sessionId: recorder['sessionId'] || 'unknown', // Access private property for now
+      type: 'Network',
+      timestamp: event.data.timestamp,
+      payload: {
+        method: event.data.method,
+        url: event.data.url,
+        requestHeaders: event.data.requestHeaders,
+        requestBody: event.data.requestBody,
+        responseStatus: event.data.responseStatus,
+        responseHeaders: event.data.responseHeaders,
+        responseBody: event.data.responseBody
+      }
+    });
+  }
+});
+
+// Error handling
+window.addEventListener('error', (event) => {
+  console.error('[ReplayX] Content script error:', event.error);
+});
+
+window.addEventListener('unhandledrejection', (event) => {
+  console.error('[ReplayX] Unhandled promise rejection:', event.reason);
+});
+
+// Cleanup on page unload
+function flushRecordingState() {
+  if (!recorder.isRecordingActive()) {
+    return;
+  }
+
+  const sessionId = recorder.getSessionId();
+  const sessionStartTime = recorder.getSessionStartTime();
+  const result = recorder.stop();
+
+  if (sessionId && result.events.length) {
+    chrome.runtime.sendMessage({
+      action: 'SAVE_RECORDING_EVENTS',
+      sessionId,
+      events: result.events,
+      sessionStartTime
+    });
+  }
 }
 
-function stopRecordingState(): { events: any[], startTime: number } {
-  const result = recorder.stop();
-  updateWidgetState(false);
-  window.postMessage({
-    source: 'replayx-content',
-    action: 'SET_MODE',
-    mode: 'IDLE'
-  }, '*');
-  return result;
-}
+window.addEventListener('pagehide', flushRecordingState);
+window.addEventListener('beforeunload', flushRecordingState);
+window.addEventListener('unload', () => {
+  if (replayer) replayer.stop();
+});
 
 // Listen for network events from the interceptor
 window.addEventListener('message', (event) => {
   if (event.data && event.data.source === 'replayx-interceptor' && event.data.type === 'Network') {
     const netEvent = event.data as NetworkEvent;
     recorder.addEvent(netEvent);
-  }
-});
-
-// Listen for commands from the extension UI / background
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.action === 'START_RECORD') {
-    console.log('[ReplayX] Start Recording');
-    startRecordingState();
-    sendResponse({ success: true, url: window.location.href, startTime: Date.now() });
-    
-  } else if (message.action === 'STOP_RECORD') {
-    console.log('[ReplayX] Stop Recording');
-    const result = stopRecordingState();
-    sendResponse({ success: true, events: result.events, startTime: result.startTime });
-    
-  } else if (message.action === 'START_REPLAY') {
-    const session: SessionData = message.session;
-    replayer.start(session);
-    sendResponse({ success: true });
   }
 });

@@ -1,142 +1,282 @@
-// Injected into MAIN world
-// We can't import easily if it's a standalone script in web_accessible_resources, 
-// so we define minimal types locally, or crxjs bundles it. We will write it self-contained just in case.
+// Network Interception Layer - Production Version
+// Handles fetch and XMLHttpRequest interception for recording and replay
 
 (function() {
   const originalFetch = window.fetch;
   const originalXHR = window.XMLHttpRequest;
 
   let mode: 'IDLE' | 'RECORD' | 'REPLAY' = 'IDLE';
-  let replayEvents: any[] = [];
-  let currentReplayIndex = 0;
+  let replayNetworkEvents: any[] = [];
+  let replayIndex = 0;
+
+  // Event queue for deterministic replay
+  let eventQueue: Array<{ type: 'microtask' | 'macrotask', callback: Function }> = [];
+  let isProcessingQueue = false;
 
   window.addEventListener('message', (event) => {
     if (event.data && event.data.source === 'replayx-content') {
       if (event.data.action === 'SET_MODE') {
         mode = event.data.mode;
-        if (mode === 'REPLAY' && event.data.events) {
-          replayEvents = event.data.events.filter((e: any) => e.type === 'Network');
-          currentReplayIndex = 0;
-          console.log('[ReplayX Interceptor] Network mock data loaded', replayEvents.length);
+        if (mode === 'REPLAY' && event.data.networkEvents) {
+          replayNetworkEvents = event.data.networkEvents;
+          replayIndex = 0;
+          console.log('[ReplayX Interceptor] Loaded', replayNetworkEvents.length, 'network events for replay');
         }
       }
     }
   });
 
-  // Monkey patch fetch
-  window.fetch = async function(...args) {
+  // Enhanced fetch interception
+  window.fetch = async function(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    const method = (init?.method || (input instanceof Request ? input.method : 'GET')).toUpperCase();
+
     if (mode === 'REPLAY') {
-      // Find matching mock
-      const reqUrl = typeof args[0] === 'string' ? args[0] : (args[0] instanceof Request ? args[0].url : '');
-      const reqMethod = (args[1]?.method || (args[0] instanceof Request ? args[0].method : 'GET')).toUpperCase();
-      
-      console.log(`[ReplayX] Replay mode intercepted fetch: ${reqMethod} ${reqUrl}`);
-      
-      const mockEvent = replayEvents.find(e => e.method === reqMethod && reqUrl.includes(e.url)); // loose matching for simplicity in MVP
+      // Find matching network event for replay
+      const mockEvent = findMatchingNetworkEvent(method, url);
       if (mockEvent) {
-        console.log(`[ReplayX] Returning mocked response for: ${reqMethod} ${reqUrl}`);
-        return new Response(mockEvent.responseBody, {
-          status: mockEvent.responseStatus,
-          headers: new Headers(mockEvent.responseHeaders)
-        });
+        console.log(`[ReplayX] Mocking fetch: ${method} ${url}`);
+        return createMockResponse(mockEvent);
       }
-      console.warn(`[ReplayX] No mock found for ${reqMethod} ${reqUrl}, passing through.`);
+      console.warn(`[ReplayX] No mock found for fetch: ${method} ${url}, passing through`);
     }
 
-    const t0 = performance.now();
-    const response = await originalFetch.apply(this, args);
-    const clonedResponse = response.clone();
+    const startTime = performance.now();
+    const response = await originalFetch.apply(this, [input, init]);
 
     if (mode === 'RECORD') {
       try {
-        const reqUrl = typeof args[0] === 'string' ? args[0] : (args[0] instanceof Request ? args[0].url : '');
-        const reqMethod = (args[1]?.method || (args[0] instanceof Request ? args[0].method : 'GET')).toUpperCase();
-        
-        let bodyInput = args[1]?.body;
-        // simplistic body extraction
-        const reqBody = typeof bodyInput === 'string' ? bodyInput : null; 
+        const clonedResponse = response.clone();
+        const requestHeaders = extractHeaders(input instanceof Request ? input.headers : init?.headers);
+        const requestBody = await extractRequestBody(input, init);
 
-        const headersObj: Record<string, string> = {};
-        clonedResponse.headers.forEach((val, key) => {
-          headersObj[key] = val;
+        const responseHeaders: Record<string, string> = {};
+        clonedResponse.headers.forEach((value, key) => {
+          responseHeaders[key] = value;
         });
 
-        const resBody = await clonedResponse.text();
+        const responseBody = await clonedResponse.text();
 
+        // Send network event to content script
         window.postMessage({
           source: 'replayx-interceptor',
           type: 'Network',
-          timestamp: t0,
-          method: reqMethod,
-          url: reqUrl,
-          requestBody: reqBody,
+          timestamp: startTime,
+          method,
+          url,
+          requestHeaders,
+          requestBody,
           responseStatus: response.status,
-          responseHeaders: headersObj,
-          responseBody: resBody
+          responseHeaders,
+          responseBody
         }, '*');
-      } catch (e) {
-        console.error('[ReplayX] Error capturing fetch response', e);
+      } catch (error) {
+        console.error('[ReplayX] Error recording fetch:', error);
       }
     }
 
     return response;
   };
 
-  // simplistic XHR patch for MVP
-  const setupXHRInterceptor = () => {
-    const originalOpen = XMLHttpRequest.prototype.open;
-    const originalSend = XMLHttpRequest.prototype.send;
+  // Enhanced XMLHttpRequest interception
+  const originalOpen = XMLHttpRequest.prototype.open;
+  const originalSend = XMLHttpRequest.prototype.send;
+  const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
 
-    XMLHttpRequest.prototype.open = function(method: string, url: string | URL, ...rest: any[]) {
-      (this as any)._method = method;
-      (this as any)._url = url.toString();
-      return originalOpen.apply(this, [method, url, ...rest] as any);
-    };
+  // Track XHR instances
+  const xhrInstances = new WeakMap<XMLHttpRequest, {
+    method: string;
+    url: string;
+    requestHeaders: Record<string, string>;
+    requestBody?: string;
+    startTime: number;
+  }>();
 
-    XMLHttpRequest.prototype.send = function(body?: Document | XMLHttpRequestBodyInit | null) {
-      if (mode === 'REPLAY') {
-         // Full XHR mocking is complex because of event listeners (onload, onreadystatechange).
-         // For the MVP, if fetch is handled, we log XHR but if the user uses modern apps, fetch is dominant.
-         // We do a very basic mock if possible, otherwise we pass through.
-         console.warn('[ReplayX] Replaying XHR is partially supported or might pass through actual network calls.');
-         // Just a placeholder. In a real scenario we'd synthesize events.
+  XMLHttpRequest.prototype.open = function(method: string, url: string | URL, ...args: any[]) {
+    const xhr = this as XMLHttpRequest;
+    const normalizedUrl = typeof url === 'string' ? url : url.href;
+
+    xhrInstances.set(xhr, {
+      method: method.toUpperCase(),
+      url: normalizedUrl,
+      requestHeaders: {},
+      startTime: performance.now()
+    });
+
+    return originalOpen.apply(xhr, [method, url, ...args]);
+  };
+
+  XMLHttpRequest.prototype.setRequestHeader = function(header: string, value: string) {
+    const xhr = this as XMLHttpRequest;
+    const instance = xhrInstances.get(xhr);
+    if (instance) {
+      instance.requestHeaders[header] = value;
+    }
+    return originalSetRequestHeader.apply(xhr, [header, value]);
+  };
+
+  XMLHttpRequest.prototype.send = function(body?: Document | XMLHttpRequestBodyInit | null) {
+    const xhr = this as XMLHttpRequest;
+    const instance = xhrInstances.get(xhr);
+
+    if (!instance) {
+      return originalSend.apply(xhr, [body]);
+    }
+
+    // Extract request body
+    if (body) {
+      if (typeof body === 'string') {
+        instance.requestBody = body;
+      } else if (body instanceof FormData) {
+        // Convert FormData to string representation
+        const formData: Record<string, string> = {};
+        for (const [key, value] of body.entries()) {
+          formData[key] = value.toString();
+        }
+        instance.requestBody = JSON.stringify(formData);
+      } else {
+        instance.requestBody = body.toString();
       }
+    }
 
-      if (mode === 'RECORD') {
-        const t0 = performance.now();
-        this.addEventListener('load', function() {
+    if (mode === 'REPLAY') {
+      // Mock XHR response
+      const mockEvent = findMatchingNetworkEvent(instance.method, instance.url);
+      if (mockEvent) {
+        console.log(`[ReplayX] Mocking XHR: ${instance.method} ${instance.url}`);
+        mockXHRResponse(xhr, mockEvent);
+        return;
+      }
+      console.warn(`[ReplayX] No mock found for XHR: ${instance.method} ${instance.url}, passing through`);
+    }
+
+    if (mode === 'RECORD') {
+      // Set up response capture
+      const originalOnLoad = xhr.onload;
+      const originalOnReadyStateChange = xhr.onreadystatechange;
+
+      xhr.onreadystatechange = function() {
+        if (xhr.readyState === XMLHttpRequest.DONE) {
           try {
-            const respHeadersStr = this.getAllResponseHeaders();
-            const headersArr = respHeadersStr.trim().split(/[\r\n]+/);
-            const headersObj: Record<string, string> = {};
-            headersArr.forEach(line => {
-              const parts = line.split(': ');
-              const header = parts.shift();
-              const value = parts.join(': ');
-              if (header) headersObj[header] = value;
-            });
+            const responseHeaders = parseResponseHeaders(xhr.getAllResponseHeaders());
 
             window.postMessage({
               source: 'replayx-interceptor',
               type: 'Network',
-              timestamp: t0,
-              method: (this as any)._method || 'UNKNOWN',
-              url: (this as any)._url || 'UNKNOWN',
-              requestBody: typeof body === 'string' ? body : null,
-              responseStatus: this.status,
-              responseHeaders: headersObj,
-              responseBody: this.responseText || ''
+              timestamp: instance.startTime,
+              method: instance.method,
+              url: instance.url,
+              requestHeaders: instance.requestHeaders,
+              requestBody: instance.requestBody,
+              responseStatus: xhr.status,
+              responseHeaders,
+              responseBody: xhr.responseText || ''
             }, '*');
-          } catch(e) {
-            console.error('[ReplayX] Error capturing XHR', e);
+          } catch (error) {
+            console.error('[ReplayX] Error recording XHR:', error);
           }
-        });
-      }
-      return originalSend.apply(this, [body] as any);
-    };
+        }
+
+        if (originalOnReadyStateChange) {
+          originalOnReadyStateChange.apply(xhr, []);
+        }
+      };
+
+      xhr.onload = function() {
+        if (originalOnLoad) {
+          originalOnLoad.apply(xhr, []);
+        }
+      };
+    }
+
+    return originalSend.apply(xhr, [body]);
   };
 
-  setupXHRInterceptor();
+  // Helper functions
+  function findMatchingNetworkEvent(method: string, url: string): any {
+    // Simple URL matching - in production, could use more sophisticated matching
+    return replayNetworkEvents.find(event =>
+      event.method === method &&
+      (url === event.url || url.includes(event.url) || event.url.includes(url))
+    );
+  }
 
-  console.log('[ReplayX] Interceptor active.');
+  function createMockResponse(event: any): Response {
+    return new Response(event.responseBody, {
+      status: event.responseStatus,
+      headers: event.responseHeaders
+    });
+  }
+
+  function mockXHRResponse(xhr: XMLHttpRequest, event: any) {
+    // Simulate XHR events for mocking
+    Object.defineProperty(xhr, 'status', { value: event.responseStatus, writable: false });
+    Object.defineProperty(xhr, 'statusText', { value: 'OK', writable: false });
+    Object.defineProperty(xhr, 'responseText', { value: event.responseBody, writable: false });
+    Object.defineProperty(xhr, 'response', { value: event.responseBody, writable: false });
+
+    // Simulate readyState changes
+    Object.defineProperty(xhr, 'readyState', { value: XMLHttpRequest.DONE, writable: false });
+
+    // Trigger events asynchronously to match real XHR behavior
+    setTimeout(() => {
+      if (xhr.onreadystatechange) {
+        xhr.onreadystatechange(new Event('readystatechange'));
+      }
+      if (xhr.onload) {
+        xhr.onload(new ProgressEvent('load', { lengthComputable: false, loaded: 0, total: 0 }));
+      }
+    }, 0);
+  }
+
+  function extractHeaders(headers?: HeadersInit): Record<string, string> {
+    const result: Record<string, string> = {};
+    if (!headers) return result;
+
+    if (headers instanceof Headers) {
+      headers.forEach((value, key) => {
+        result[key] = value;
+      });
+    } else if (Array.isArray(headers)) {
+      headers.forEach(([key, value]) => {
+        result[key] = value;
+      });
+    } else {
+      Object.assign(result, headers);
+    }
+
+    return result;
+  }
+
+  async function extractRequestBody(input: RequestInfo | URL, init?: RequestInit): Promise<string | undefined> {
+    if (init?.body) {
+      if (typeof init.body === 'string') return init.body;
+      if (init.body instanceof FormData) {
+        const data: Record<string, string> = {};
+        for (const [key, value] of init.body.entries()) {
+          data[key] = value.toString();
+        }
+        return JSON.stringify(data);
+      }
+    }
+    return undefined;
+  }
+
+  function parseResponseHeaders(headerString: string): Record<string, string> {
+    const headers: Record<string, string> = {};
+    const lines = headerString.trim().split(/[\r\n]+/);
+
+    lines.forEach(line => {
+      const index = line.indexOf(': ');
+      if (index > 0) {
+        const key = line.substring(0, index);
+        const value = line.substring(index + 2);
+        headers[key] = value;
+      }
+    });
+
+    return headers;
+  }
+
+  console.log('[ReplayX] Network interceptor initialized');
 })();

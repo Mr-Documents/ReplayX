@@ -1,208 +1,471 @@
-import { SessionData, RecordedEvent } from '../types';
+import { SessionData, RecordedEvent, ReplayState, ClickPayload, InputPayload, ScrollPayload, MutationPayload, NavigationPayload, FocusPayload, BlurPayload } from '../types';
 
 export class Replayer {
   private isReplaying = false;
-  private cursor: HTMLElement | null = null;
+  private state: ReplayState = {
+    isPlaying: false,
+    currentTime: 0,
+    speed: 1,
+    paused: false
+  };
 
-  async start(session: SessionData) {
+  private eventQueue: Array<{
+    event: RecordedEvent;
+    scheduledTime: number;
+    executed: boolean;
+  }> = [];
+
+  private cursor: HTMLElement | null = null;
+  private replayStartTime: number = 0;
+  private session: SessionData | null = null;
+
+  // Async event handling
+  private microtaskQueue: Function[] = [];
+  private macrotaskQueue: Function[] = [];
+  private isProcessingQueues = false;
+
+  // Error tracking
+  private replayErrors: Array<{ event: RecordedEvent; error: string }> = [];
+
+  async start(session: SessionData, options: { speed?: number } = {}) {
     if (this.isReplaying) return;
     this.isReplaying = true;
+    this.session = session;
+    this.state.speed = options.speed || 1;
+    this.replayStartTime = performance.now();
+    this.replayErrors = [];
 
-    console.log('[ReplayX] Starting replay for session', session.id);
-    
-    // Configure interceptor for network mocking
+    console.log('[ReplayX Replayer] Starting deterministic replay for session:', session.id);
+
+    // Configure network interceptor
     window.postMessage({
       source: 'replayx-content',
       action: 'SET_MODE',
       mode: 'REPLAY',
-      events: session.events
+      networkEvents: session.events.filter(e => e.type === 'Network')
     }, '*');
 
     this.createCursor();
+    this.scheduleEvents(session.events);
 
-    // Simulate events sequentially based on timestamp
-    const domEvents = session.events.filter(e => e.type === 'Click' || e.type === 'Input');
-    const networkEvents = session.events.filter(e => e.type === 'Network');
-    
-    console.log(`[ReplayX] Found ${domEvents.length} DOM events and ${networkEvents.length} network events`);
-    
-    if (domEvents.length === 0 && networkEvents.length === 0) {
-      console.log('[ReplayX] No events to replay');
-      alert('ReplayX: No events were recorded in this session.');
-      this.finishReplay();
-      return;
-    }
-    
-    if (domEvents.length === 0) {
-      console.log('[ReplayX] Only network events found - network mocking is active');
-      // Show a brief message then finish - network events are handled by interceptor
-      setTimeout(() => {
-        console.log('[ReplayX] Network replay complete');
-        this.finishReplay();
-      }, 2000);
-      return;
-    }
+    // Start replay loop
+    this.state.isPlaying = true;
+    this.replayLoop();
 
-    const firstEventTime = domEvents[0].timestamp;
-    
-    for (let i = 0; i < domEvents.length; i++) {
-        const ev = domEvents[i];
-        const prevEv = i > 0 ? domEvents[i-1] : domEvents[0];
-        
-        let delay = ev.timestamp - prevEv.timestamp;
-        if (delay > 2000) delay = 2000;
-        
-        await this.delayMs(delay);
-        
-        try {
-            await this.dispatchDOMEvent(ev);
-        } catch (e) {
-            console.error('[ReplayX] Failed to dispatch event', ev, e);
-        }
-    }
-
-    console.log('[ReplayX] Replay Finished.');
-    this.finishReplay();
+    // Set up replay controls
+    this.setupKeyboardControls();
   }
 
-  private finishReplay() {
+  stop() {
     this.isReplaying = false;
+    this.state.isPlaying = false;
+    this.eventQueue = [];
+    this.microtaskQueue = [];
+    this.macrotaskQueue = [];
+
     if (this.cursor) {
       this.cursor.remove();
       this.cursor = null;
     }
-    chrome.runtime.sendMessage({ action: 'REPLAY_FINISHED' });
+
+    // Reset interceptor
+    window.postMessage({
+      source: 'replayx-content',
+      action: 'SET_MODE',
+      mode: 'IDLE'
+    }, '*');
+
+    chrome.runtime.sendMessage({
+      action: 'REPLAY_FINISHED',
+      errors: this.replayErrors
+    });
+
+    console.log('[ReplayX Replayer] Replay stopped');
+  }
+
+  pause() {
+    this.state.paused = true;
+    console.log('[ReplayX Replayer] Replay paused');
+  }
+
+  resume() {
+    this.state.paused = false;
+    console.log('[ReplayX Replayer] Replay resumed');
+  }
+
+  setSpeed(speed: number) {
+    this.state.speed = Math.max(0.1, Math.min(10, speed));
+    console.log('[ReplayX Replayer] Speed set to:', this.state.speed);
+  }
+
+  private scheduleEvents(events: RecordedEvent[]) {
+    this.eventQueue = events.map(event => ({
+      event,
+      scheduledTime: event.timestamp,
+      executed: false
+    })).sort((a, b) => a.scheduledTime - b.scheduledTime);
+
+    console.log(`[ReplayX Replayer] Scheduled ${this.eventQueue.length} events`);
+  }
+
+  private async replayLoop() {
+    while (this.isReplaying && this.state.isPlaying) {
+      if (this.state.paused) {
+        await this.delayMs(100);
+        continue;
+      }
+
+      const currentTime = (performance.now() - this.replayStartTime) * this.state.speed;
+      this.state.currentTime = currentTime;
+
+      // Execute due events
+      const dueEvents = this.eventQueue.filter(item =>
+        !item.executed && item.scheduledTime <= currentTime
+      );
+
+      for (const item of dueEvents) {
+        try {
+          await this.executeEvent(item.event);
+          item.executed = true;
+        } catch (error) {
+          console.error('[ReplayX Replayer] Event execution failed:', item.event, error);
+          this.replayErrors.push({
+            event: item.event,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+      }
+
+      // Process async queues
+      await this.processAsyncQueues();
+
+      // Check if replay is complete
+      const completedEvents = this.eventQueue.filter(item => item.executed).length;
+      if (completedEvents === this.eventQueue.length) {
+        console.log('[ReplayX Replayer] All events replayed');
+        this.stop();
+        return;
+      }
+
+      // Small delay to prevent busy loop
+      await this.delayMs(16); // ~60fps
+    }
+  }
+
+  private async executeEvent(event: RecordedEvent) {
+    switch (event.type) {
+      case 'Click':
+        await this.executeClick(event);
+        break;
+      case 'Input':
+        await this.executeInput(event);
+        break;
+      case 'Scroll':
+        await this.executeScroll(event);
+        break;
+      case 'Mutation':
+        await this.executeMutation(event);
+        break;
+      case 'Navigation':
+        await this.executeNavigation(event);
+        break;
+      case 'Resize':
+        await this.executeResize(event);
+        break;
+      case 'Focus':
+        await this.executeFocus(event);
+        break;
+      case 'Blur':
+        await this.executeBlur(event);
+        break;
+      default:
+        console.warn('[ReplayX Replayer] Unknown event type:', event.type);
+    }
+  }
+
+  private async executeClick(event: RecordedEvent) {
+    if (event.type !== 'Click') return;
+    const payload = event.payload as ClickPayload;
+    const selector = payload.selector;
+    let element = this.findElement(selector);
+
+    if (!element) {
+      console.warn('[ReplayX Replayer] Click target not found:', selector);
+      return;
+    }
+
+    // Ensure element is visible
+    element.scrollIntoView({ behavior: 'instant', block: 'center' });
+    await this.delayMs(50);
+
+    // Move cursor
+    this.moveCursorTo(element);
+    await this.delayMs(100);
+
+    // Check if element is interactable
+    if (!this.isElementInteractable(element)) {
+      console.warn('[ReplayX Replayer] Element not interactable:', selector);
+      return;
+    }
+
+    // Dispatch mouse events in correct order
+    const rect = element.getBoundingClientRect();
+    const eventOptions = {
+      bubbles: true,
+      cancelable: true,
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2
+    };
+
+    element.dispatchEvent(new MouseEvent('mouseenter', eventOptions));
+    await this.delayMs(10);
+    element.dispatchEvent(new MouseEvent('mousedown', eventOptions));
+    await this.delayMs(10);
+    element.dispatchEvent(new MouseEvent('mouseup', eventOptions));
+    await this.delayMs(10);
+    element.dispatchEvent(new MouseEvent('click', eventOptions));
+  }
+
+  private async executeInput(event: RecordedEvent) {
+    if (event.type !== 'Input') return;
+    const payload = event.payload as InputPayload;
+    const selector = payload.selector;
+    const value = payload.value;
+    let element = this.findElement(selector) as HTMLInputElement | HTMLTextAreaElement;
+
+    if (!element) {
+      console.warn('[ReplayX Replayer] Input target not found:', selector);
+      return;
+    }
+
+    element.scrollIntoView({ behavior: 'instant', block: 'center' });
+    await this.delayMs(50);
+
+    this.moveCursorTo(element);
+    await this.delayMs(100);
+
+    if (!this.isElementInteractable(element)) {
+      console.warn('[ReplayX Replayer] Input element not interactable:', selector);
+      return;
+    }
+
+    // Focus first
+    element.focus();
+    await this.delayMs(50);
+
+    // Set value and dispatch events
+    element.value = value;
+    element.dispatchEvent(new Event('input', { bubbles: true }));
+    await this.delayMs(50);
+    element.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  private async executeScroll(event: RecordedEvent) {
+    if (event.type !== 'Scroll') return;
+    const payload = event.payload as ScrollPayload;
+    const selector = payload.selector;
+    const scrollTop = payload.scrollTop;
+    const scrollLeft = payload.scrollLeft;
+
+    let element = selector === 'window' ? window : this.findElement(selector);
+    if (!element) return;
+
+    if (element === window) {
+      window.scrollTo(scrollLeft, scrollTop);
+    } else {
+      (element as HTMLElement).scrollTop = scrollTop;
+      (element as HTMLElement).scrollLeft = scrollLeft;
+    }
+  }
+
+  private async executeMutation(event: RecordedEvent) {
+    if (event.type !== 'Mutation') return;
+    const payload = event.payload as MutationPayload;
+    // For replay, mutations are handled by the original events that caused them
+    // This is mainly for logging/debugging
+    console.log('[ReplayX Replayer] Mutation event:', payload.type, payload.targetSelector);
+  }
+
+  private async executeNavigation(event: RecordedEvent) {
+    if (event.type !== 'Navigation') return;
+    const payload = event.payload as NavigationPayload;
+    const url = payload.url;
+    console.log('[ReplayX Replayer] Navigation to:', url);
+    // Navigation is handled at the session level, not per event
+  }
+
+  private async executeResize(event: RecordedEvent) {
+    // Resize events are informational, actual resize is handled by browser
+    console.log('[ReplayX Replayer] Resize event:', event.payload);
+  }
+
+  private async executeFocus(event: RecordedEvent) {
+    if (event.type !== 'Focus') return;
+    const payload = event.payload as FocusPayload;
+    const selector = payload.selector;
+    let element = this.findElement(selector) as HTMLElement;
+    if (element) {
+      element.focus();
+    }
+  }
+
+  private async executeBlur(event: RecordedEvent) {
+    if (event.type !== 'Blur') return;
+    const payload = event.payload as BlurPayload;
+    const selector = payload.selector;
+    let element = this.findElement(selector) as HTMLElement;
+    if (element) {
+      element.blur();
+    }
+  }
+
+  private findElement(selector: string): HTMLElement | null {
+    try {
+      // Try primary selector
+      let element = document.querySelector(selector) as HTMLElement;
+      if (element) return element;
+
+      // Try alternative selectors
+      return this.tryAlternativeSelectors(selector);
+    } catch (error) {
+      console.error('[ReplayX Replayer] Error finding element:', selector, error);
+      return null;
+    }
+  }
+
+  private tryAlternativeSelectors(originalSelector: string): HTMLElement | null {
+    // Try data attributes
+    const dataAttrs = ['data-testid', 'data-cy', 'data-test'];
+    for (const attr of dataAttrs) {
+      if (originalSelector.includes(`[${attr}`)) {
+        const value = originalSelector.match(new RegExp(`\\[${attr}="([^"]+)"\\]`))?.[1];
+        if (value) {
+          const element = document.querySelector(`[${attr}="${value}"]`) as HTMLElement;
+          if (element) return element;
+        }
+      }
+    }
+
+    // Try ID
+    const idMatch = originalSelector.match(/#([^ >]+)/);
+    if (idMatch) {
+      const element = document.getElementById(idMatch[1]);
+      if (element) return element;
+    }
+
+    // Try simplified selector
+    const parts = originalSelector.split(' > ');
+    const lastPart = parts[parts.length - 1].split(':')[0];
+    const element = document.querySelector(lastPart) as HTMLElement;
+    if (element) return element;
+
+    return null;
+  }
+
+  private isElementInteractable(element: HTMLElement): boolean {
+    const style = window.getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+
+    return style.display !== 'none' &&
+           style.visibility !== 'hidden' &&
+           !element.hasAttribute('disabled') &&
+           rect.width > 0 &&
+           rect.height > 0 &&
+           rect.top >= 0 &&
+           rect.left >= 0 &&
+           rect.bottom <= window.innerHeight &&
+           rect.right <= window.innerWidth;
+  }
+
+  private async processAsyncQueues() {
+    if (this.isProcessingQueues) return;
+    this.isProcessingQueues = true;
+
+    // Process microtasks first
+    while (this.microtaskQueue.length > 0) {
+      const task = this.microtaskQueue.shift()!;
+      try {
+        await task();
+      } catch (error) {
+        console.error('[ReplayX Replayer] Microtask error:', error);
+      }
+    }
+
+    // Process macrotasks
+    while (this.macrotaskQueue.length > 0) {
+      const task = this.macrotaskQueue.shift()!;
+      try {
+        await task();
+      } catch (error) {
+        console.error('[ReplayX Replayer] Macrotask error:', error);
+      }
+    }
+
+    this.isProcessingQueues = false;
   }
 
   private createCursor() {
     if (this.cursor) return;
+
     this.cursor = document.createElement('div');
-    this.cursor.style.width = '20px';
-    this.cursor.style.height = '20px';
-    this.cursor.style.borderRadius = '10px';
-    this.cursor.style.backgroundColor = 'rgba(255, 0, 0, 0.5)';
-    this.cursor.style.border = '2px solid red';
-    this.cursor.style.position = 'fixed';
-    this.cursor.style.zIndex = '9999999';
-    this.cursor.style.pointerEvents = 'none';
-    this.cursor.style.transition = 'all 0.3s ease-out';
-    this.cursor.style.top = '50%';
-    this.cursor.style.left = '50%';
+    Object.assign(this.cursor.style, {
+      position: 'fixed',
+      width: '20px',
+      height: '20px',
+      borderRadius: '50%',
+      backgroundColor: 'rgba(255, 0, 0, 0.8)',
+      border: '2px solid #ff0000',
+      zIndex: '9999999',
+      pointerEvents: 'none',
+      transition: 'all 0.2s ease-out',
+      boxShadow: '0 0 10px rgba(255, 0, 0, 0.5)'
+    });
+
     document.body.appendChild(this.cursor);
   }
 
-  private moveCursorTo(el: HTMLElement) {
+  private moveCursorTo(element: HTMLElement) {
     if (!this.cursor) return;
-    const rect = el.getBoundingClientRect();
-    const x = rect.left + rect.width / 2;
-    const y = rect.top + rect.height / 2;
-    this.cursor.style.left = `${x - 10}px`;
-    this.cursor.style.top = `${y - 10}px`;
-    
-    // add click ripple effect
-    this.cursor.style.transform = 'scale(0.8)';
+
+    const rect = element.getBoundingClientRect();
+    const x = rect.left + rect.width / 2 - 10;
+    const y = rect.top + rect.height / 2 - 10;
+
+    this.cursor.style.left = `${x}px`;
+    this.cursor.style.top = `${y}px`;
+    this.cursor.style.transform = 'scale(1.2)';
+
     setTimeout(() => {
-        if (this.cursor) this.cursor.style.transform = 'scale(1)';
-    }, 150);
+      if (this.cursor) this.cursor.style.transform = 'scale(1)';
+    }, 200);
   }
 
-  private async dispatchDOMEvent(ev: RecordedEvent) {
-      if (ev.type === 'Click') {
-          let el = document.querySelector(ev.selector) as HTMLElement;
-          
-          // Try alternative selectors if primary fails
-          if (!el) {
-            el = this.tryAlternativeSelectors(ev.selector);
-          }
-          
-          if (el) {
-              console.log('[ReplayX] Clicking element:', ev.selector);
-              el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-              await this.delayMs(300); // Wait for scroll
-              this.moveCursorTo(el);
-              await this.delayMs(300); // Wait for cursor move
-              
-              // Ensure element is visible and enabled
-              if (this.isElementInteractable(el)) {
-                  el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
-                  await this.delayMs(50);
-                  el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
-                  await this.delayMs(50);
-                  el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-              } else {
-                  console.warn('[ReplayX] Element not interactable:', ev.selector);
-              }
-          } else {
-              console.warn('[ReplayX Replayer] Click target not found:', ev.selector);
-          }
-      } else if (ev.type === 'Input') {
-          let el = document.querySelector(ev.selector) as HTMLInputElement;
-          
-          // Try alternative selectors if primary fails
-          if (!el) {
-            el = this.tryAlternativeSelectors(ev.selector) as HTMLInputElement;
-          }
-          
-          if (el) {
-              console.log('[ReplayX] Inputting into element:', ev.selector);
-              el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-              await this.delayMs(300);
-              this.moveCursorTo(el);
-              await this.delayMs(300);
-              
-              if (this.isElementInteractable(el)) {
-                  el.value = ev.value || '';
-                  el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-                  await this.delayMs(100);
-                  el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-              } else {
-                  console.warn('[ReplayX] Input element not interactable:', ev.selector);
-              }
-          } else {
-              console.warn('[ReplayX Replayer] Input target not found:', ev.selector);
-          }
+  private setupKeyboardControls() {
+    const handler = (e: KeyboardEvent) => {
+      switch (e.key) {
+        case ' ':
+          e.preventDefault();
+          if (this.state.paused) this.resume();
+          else this.pause();
+          break;
+        case 'Escape':
+          e.preventDefault();
+          this.stop();
+          break;
       }
+    };
+
+    document.addEventListener('keydown', handler);
+
+    // Cleanup on stop
+    const originalStop = this.stop.bind(this);
+    this.stop = () => {
+      document.removeEventListener('keydown', handler);
+      originalStop();
+    };
   }
 
-  private tryAlternativeSelectors(originalSelector: string): HTMLElement | null {
-    // Try to find element by text content if it's a button/link
-    if (originalSelector.includes('button') || originalSelector.includes('a')) {
-      const elements = Array.from(document.querySelectorAll('button, a'));
-      for (const el of elements) {
-        if (el.textContent && el.textContent.trim().length > 0) {
-          return el as HTMLElement;
-        }
-      }
-    }
-    
-    // Try simplified selector (just tag name and classes)
-    const parts = originalSelector.split(' > ');
-    const lastPart = parts[parts.length - 1];
-    const simpleSelector = lastPart.split(':')[0]; // Remove nth-of-type
-    
-    const el = document.querySelector(simpleSelector);
-    if (el) return el as HTMLElement;
-    
-    // Try to find by ID if selector contains one
-    const idMatch = originalSelector.match(/#([^ >]+)/);
-    if (idMatch) {
-      const idEl = document.getElementById(idMatch[1]);
-      if (idEl) return idEl;
-    }
-    
-    return null;
-  }
-
-  private isElementInteractable(el: HTMLElement): boolean {
-    const style = window.getComputedStyle(el);
-    return style.display !== 'none' && 
-           style.visibility !== 'hidden' && 
-           !el.hasAttribute('disabled') &&
-           el.offsetWidth > 0 && 
-           el.offsetHeight > 0;
-  }
-
-  private delayMs(ms: number) {
-      return new Promise(resolve => setTimeout(resolve, ms));
+  private delayMs(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms / this.state.speed));
   }
 }
