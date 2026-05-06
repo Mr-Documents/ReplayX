@@ -17,6 +17,7 @@ const sessionStates = new Map<string, {
   status: 'recording' | 'paused' | 'completed' | 'replaying';
   tabId: number;
   startTime: number;
+  url: string;
   events: RecordedEvent[];
 }>();
 
@@ -220,6 +221,7 @@ async function handleStartRecording(sendResponse: (response: any) => void) {
       status: 'recording',
       tabId: tab.id,
       startTime: recordingStartTime,
+      url: tab.url || '',
       events: []
     });
 
@@ -277,7 +279,7 @@ async function handleStopRecording(sendResponse: (response: any) => void) {
         // Create session data
         const session: SessionData = {
           id: currentSessionId,
-          url: response.url || 'unknown',
+          url: sessionState.url || response.url || 'unknown',
           startTime: sessionState.startTime,
           events: mergedEvents,
           metadata: {
