@@ -212,11 +212,3 @@ window.addEventListener('beforeunload', flushRecordingState);
 window.addEventListener('unload', () => {
   if (replayer) replayer.stop();
 });
-
-// Listen for network events from the interceptor
-window.addEventListener('message', (event) => {
-  if (event.data && event.data.source === 'replayx-interceptor' && event.data.type === 'Network') {
-    const netEvent = event.data as NetworkEvent;
-    recorder.addEvent(netEvent);
-  }
-});

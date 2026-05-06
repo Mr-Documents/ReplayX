@@ -350,8 +350,8 @@ async function handleReplaySession(sessionId: string, speed: number, sendRespons
     const currentUrl = new URL(tab.url || '');
     const sessionUrl = new URL(session.url);
 
-    if (currentUrl.origin !== sessionUrl.origin || currentUrl.pathname !== sessionUrl.pathname) {
-      // Navigate to session URL
+    if (currentUrl.href !== sessionUrl.href) {
+      // Navigate to the exact recorded session URL
       await chrome.tabs.update(tab.id, { url: session.url });
       // Replay will start automatically via tabs.onUpdated listener
       sendResponse({ success: true });
