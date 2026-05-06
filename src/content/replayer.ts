@@ -14,6 +14,7 @@ export class Replayer {
     scheduledTime: number;
     executed: boolean;
   }> = [];
+  private nextEventIndex = 0;
 
   private cursor: HTMLElement | null = null;
   private replayStartTime: number = 0;
@@ -99,13 +100,16 @@ export class Replayer {
   }
 
   private scheduleEvents(events: RecordedEvent[]) {
+    const offset = events.length > 0 ? Math.min(...events.map(event => event.timestamp)) : 0;
+
     this.eventQueue = events.map(event => ({
       event,
-      scheduledTime: event.timestamp,
+      scheduledTime: event.timestamp - offset,
       executed: false
     })).sort((a, b) => a.scheduledTime - b.scheduledTime);
 
-    console.log(`[ReplayX Replayer] Scheduled ${this.eventQueue.length} events`);
+    this.nextEventIndex = 0;
+    console.log(`[ReplayX Replayer] Scheduled ${this.eventQueue.length} events (offset ${offset}ms)`);
   }
 
   private async replayLoop() {
@@ -118,12 +122,11 @@ export class Replayer {
       const currentTime = (performance.now() - this.replayStartTime) * this.state.speed;
       this.state.currentTime = currentTime;
 
-      // Execute due events
-      const dueEvents = this.eventQueue.filter(item =>
-        !item.executed && item.scheduledTime <= currentTime
-      );
-
-      for (const item of dueEvents) {
+      // Execute due events in queue order
+      while (this.nextEventIndex < this.eventQueue.length &&
+             !this.eventQueue[this.nextEventIndex].executed &&
+             this.eventQueue[this.nextEventIndex].scheduledTime <= currentTime) {
+        const item = this.eventQueue[this.nextEventIndex];
         try {
           await this.executeEvent(item.event);
           item.executed = true;
@@ -134,14 +137,14 @@ export class Replayer {
             error: error instanceof Error ? error.message : String(error)
           });
         }
+        this.nextEventIndex += 1;
       }
 
       // Process async queues
       await this.processAsyncQueues();
 
       // Check if replay is complete
-      const completedEvents = this.eventQueue.filter(item => item.executed).length;
-      if (completedEvents === this.eventQueue.length) {
+      if (this.nextEventIndex >= this.eventQueue.length) {
         console.log('[ReplayX Replayer] All events replayed');
         this.stop();
         return;
