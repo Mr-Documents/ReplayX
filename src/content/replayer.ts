@@ -36,6 +36,36 @@ export class Replayer {
     this.replayStartTime = performance.now();
     this.replayErrors = [];
 
+    // Check if we are starting from scratch or resuming after a navigation
+    const isResuming = sessionStorage.getItem('replayx_active') === 'true';
+
+    // MVP Improvement: Restore Initial State only on the first page of the session
+    if (session.initialState && !isResuming) {
+      console.log('[ReplayX Replayer] Initial state found. Clearing and restoring storage...');
+      
+      // Clear current state to ensure determinism
+      localStorage.clear();
+      sessionStorage.clear();
+
+      // Restore localStorage safely
+      if (session.initialState.localStorage) {
+        Object.entries(session.initialState.localStorage).forEach(([k, v]) => localStorage.setItem(k, v as string));
+      }
+
+      // Restore sessionStorage safely
+      if (session.initialState.sessionStorage) {
+        Object.entries(session.initialState.sessionStorage).forEach(([k, v]) => sessionStorage.setItem(k, v as string));
+      }
+      
+      // Set control flag AFTER restoration so it isn't wiped
+      sessionStorage.setItem('replayx_active', 'true');
+      
+      // A reload is required for the app to initialize with the injected storage
+      console.log('[ReplayX Replayer] Initial state restored. Reloading to initialize app...');
+      window.location.reload();
+      return;
+    }
+
     console.log('[ReplayX Replayer] Starting deterministic replay for session:', session.id);
 
     // Configure network interceptor
@@ -47,7 +77,7 @@ export class Replayer {
     }, '*');
 
     this.createCursor();
-    this.scheduleEvents(session.events);
+    this.scheduleEvents(session.events, window.location.href);
 
     // Start replay loop
     this.state.isPlaying = true;
@@ -57,7 +87,7 @@ export class Replayer {
     this.setupKeyboardControls();
   }
 
-  stop() {
+  stop(isFinished = false) {
     this.isReplaying = false;
     this.state.isPlaying = false;
     this.eventQueue = [];
@@ -76,10 +106,13 @@ export class Replayer {
       mode: 'IDLE'
     }, '*');
 
-    chrome.runtime.sendMessage({
-      action: 'REPLAY_FINISHED',
-      errors: this.replayErrors
-    });
+    // Only signal completion to the background if we actually finished or were manually stopped
+    if ((isFinished || !window.closed) && chrome.runtime?.id) {
+      chrome.runtime.sendMessage({
+        action: 'REPLAY_FINISHED',
+        errors: this.replayErrors
+      });
+    }
 
     console.log('[ReplayX Replayer] Replay stopped');
   }
@@ -99,10 +132,21 @@ export class Replayer {
     console.log('[ReplayX Replayer] Speed set to:', this.state.speed);
   }
 
-  private scheduleEvents(events: RecordedEvent[]) {
-    const offset = events.length > 0 ? Math.min(...events.map(event => event.timestamp)) : 0;
+  private scheduleEvents(events: RecordedEvent[], currentUrl: string) {
+    // Filter events to only include those relevant to the current page.
+    // We skip all events that happened before the last 'Navigation' to this URL.
+    let lastNavIndex = -1;
+    for (let i = 0; i < events.length; i++) {
+      const payload = events[i].payload as NavigationPayload;
+      if (events[i].type === 'Navigation' && payload.url === currentUrl) {
+        lastNavIndex = i;
+      }
+    }
 
-    this.eventQueue = events.map(event => ({
+    const eventsToSchedule = lastNavIndex !== -1 ? events.slice(lastNavIndex) : events;
+    const offset = eventsToSchedule.length > 0 ? eventsToSchedule[0].timestamp : 0;
+
+    this.eventQueue = eventsToSchedule.map(event => ({
       event,
       scheduledTime: event.timestamp - offset,
       executed: false
@@ -146,7 +190,7 @@ export class Replayer {
       // Check if replay is complete
       if (this.nextEventIndex >= this.eventQueue.length) {
         console.log('[ReplayX Replayer] All events replayed');
-        this.stop();
+        this.stop(true);
         return;
       }
 
@@ -371,13 +415,10 @@ export class Replayer {
 
     return style.display !== 'none' &&
            style.visibility !== 'hidden' &&
+           style.opacity !== '0' &&
            !element.hasAttribute('disabled') &&
            rect.width > 0 &&
-           rect.height > 0 &&
-           rect.top >= 0 &&
-           rect.left >= 0 &&
-           rect.bottom <= window.innerHeight &&
-           rect.right <= window.innerWidth;
+           rect.height > 0;
   }
 
   private async processAsyncQueues() {

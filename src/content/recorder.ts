@@ -9,6 +9,7 @@ import {
   FocusEvent,
   BlurEvent
 } from '../types';
+import { SessionData } from '../types';
 
 export class Recorder {
   private events: RecordedEvent[] = [];
@@ -33,6 +34,15 @@ export class Recorder {
     this.sessionId = sessionId;
     this.events = [];
     this.sessionStartTime = sessionStartTime ?? Date.now();
+
+    // MVP Improvement: Capture initial state
+    const initialState = {
+      localStorage: { ...localStorage },
+      sessionStorage: { ...sessionStorage },
+      url: window.location.href,
+      viewport: { width: window.innerWidth, height: window.innerHeight }
+    };
+    console.log('[ReplayX Recorder] Captured initial state');
 
     // Add event listeners
     document.addEventListener('click', this.boundClickHandler, true);
@@ -137,6 +147,14 @@ export class Recorder {
   private onInput(e: Event) {
     const target = e.target as HTMLInputElement | HTMLTextAreaElement;
     const selector = this.getRobustSelector(target);
+    
+    // MVP Improvement: Basic Privacy Masking
+    let value = target.value;
+    const isSensitive = target.type === 'password' || 
+                        target.name.toLowerCase().includes('card') ||
+                        target.hasAttribute('data-replay-mask');
+    
+    if (isSensitive) value = '********';
 
     this.addEvent({
       id: crypto.randomUUID(),
@@ -145,7 +163,7 @@ export class Recorder {
       type: 'Input',
       payload: {
         selector,
-        value: target.value,
+        value,
         inputType: (e as any).inputType || 'unknown'
       }
     });
