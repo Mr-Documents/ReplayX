@@ -109,6 +109,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           success: true,
           events: result.events,
           startTime: result.startTime,
+          initialState: result.initialState,
           url: window.location.href,
           viewport: { width: window.innerWidth, height: window.innerHeight }
         });
@@ -202,7 +203,8 @@ function flushRecordingState() {
       action: 'SAVE_RECORDING_EVENTS',
       sessionId,
       events: result.events,
-      sessionStartTime
+      sessionStartTime,
+      initialState: result.initialState
     });
   }
 }

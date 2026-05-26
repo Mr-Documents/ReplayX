@@ -28,7 +28,7 @@ export class Replayer {
   // Error tracking
   private replayErrors: Array<{ event: RecordedEvent; error: string }> = [];
 
-  async start(session: SessionData, options: { speed?: number } = {}) {
+  async start(session: SessionData & { initialState?: any }, options: { speed?: number } = {}) {
     if (this.isReplaying) return;
     this.isReplaying = true;
     this.session = session;

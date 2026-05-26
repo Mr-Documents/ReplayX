@@ -16,6 +16,7 @@ export class Recorder {
   private sessionId: string = '';
   private sessionStartTime: number = 0;
   private isRecording = false;
+  private initialState: any = null;
   private mutationObserver: MutationObserver | null = null;
   private scrollTimeout: number | null = null;
 
@@ -35,10 +36,10 @@ export class Recorder {
     this.events = [];
     this.sessionStartTime = sessionStartTime ?? Date.now();
 
-    // MVP Improvement: Capture initial state
-    const initialState = {
-      localStorage: { ...localStorage },
-      sessionStorage: { ...sessionStorage },
+    // MVP Improvement: Capture initial state correctly using helper
+    this.initialState = {
+      localStorage: this.captureStorage(localStorage),
+      sessionStorage: this.captureStorage(sessionStorage),
       url: window.location.href,
       viewport: { width: window.innerWidth, height: window.innerHeight }
     };
@@ -62,8 +63,8 @@ export class Recorder {
     console.log('[ReplayX Recorder] Started recording session:', sessionId);
   }
 
-  stop(): { events: RecordedEvent[], startTime: number } {
-    if (!this.isRecording) return { events: [], startTime: 0 };
+  stop(): { events: RecordedEvent[], startTime: number, initialState: any } {
+    if (!this.isRecording) return { events: [], startTime: 0, initialState: null };
 
     this.isRecording = false;
 
@@ -90,9 +91,11 @@ export class Recorder {
 
     const result = {
       events: this.events,
-      startTime: this.sessionStartTime
+      startTime: this.sessionStartTime,
+      initialState: this.initialState
     };
     this.events = [];
+    this.initialState = null;
     console.log('[ReplayX Recorder] Stopped recording, captured', result.events.length, 'events');
     return result;
   }
@@ -123,6 +126,17 @@ export class Recorder {
 
   private getTimestamp(): number {
     return Date.now() - this.sessionStartTime;
+  }
+
+  private captureStorage(storage: Storage): Record<string, string> {
+    const data: Record<string, string> = {};
+    for (let i = 0; i < storage.length; i++) {
+      const key = storage.key(i);
+      if (key) {
+        data[key] = storage.getItem(key) || '';
+      }
+    }
+    return data;
   }
 
   private onClick(e: MouseEvent) {
