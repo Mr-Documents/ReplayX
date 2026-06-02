@@ -114,7 +114,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case 'STOP_REPLAY':
       handleStopReplay(sendResponse);
-      break;
+      return true; // async
 
     case 'SET_REPLAY_SPEED':
       replaySpeed = Math.max(0.1, Math.min(10, message.speed || 1));
@@ -323,8 +323,25 @@ function handleSaveRecordingEvents(sessionId: string, events: RecordedEvent[], s
 // Replay handlers
 async function handleReplaySession(sessionId: string, speed: number, sendResponse: (response: any) => void) {
   if (activeReplaySession) {
-    sendResponse({ success: false, error: 'Replay already in progress' });
-    return;
+    // Stale session check: verify if the replay tab still exists
+    let isStale = false;
+    if (!replayTabId) {
+      isStale = true;
+    } else {
+      try {
+        await chrome.tabs.get(replayTabId);
+      } catch (e) {
+        isStale = true;
+      }
+    }
+
+    if (isStale) {
+      activeReplaySession = null;
+      replayTabId = null;
+    } else {
+      sendResponse({ success: false, error: 'Replay already in progress' });
+      return;
+    }
   }
 
   try {
@@ -382,13 +399,19 @@ async function handleReplaySession(sessionId: string, speed: number, sendRespons
 
 function handleStopReplay(sendResponse: (response: any) => void) {
   if (replayTabId) {
-    chrome.tabs.sendMessage(replayTabId, { action: 'STOP_REPLAY' }, () => {
+    // Clear local state regardless of whether the content script responds
+    // to prevent the replayer from getting stuck in a "replaying" state.
+    chrome.tabs.sendMessage(replayTabId, { action: 'STOP_REPLAY' }, (response) => {
+      if (chrome.runtime.lastError) {
+        console.log('[ReplayX BG] Stop signal sent to inactive tab, clearing state.');
+      }
       activeReplaySession = null;
       replayTabId = null;
       sendResponse({ success: true });
     });
   } else {
-    sendResponse({ success: false, error: 'No active replay' });
+    activeReplaySession = null;
+    sendResponse({ success: true });
   }
 }
 
