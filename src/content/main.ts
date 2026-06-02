@@ -5,6 +5,9 @@ import { SessionData, NetworkEvent } from '../types';
 const recorder = new Recorder();
 const replayer = new Replayer();
 
+// Sync widget state when replay finishes naturally
+replayer.onStop = () => updateWidgetState(false);
+
 // Create floating widget
 let widget: HTMLDivElement | null = null;
 
@@ -211,6 +214,3 @@ function flushRecordingState() {
 
 window.addEventListener('pagehide', flushRecordingState);
 window.addEventListener('beforeunload', flushRecordingState);
-window.addEventListener('unload', () => {
-  if (replayer) replayer.stop();
-});

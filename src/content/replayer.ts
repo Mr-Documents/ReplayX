@@ -20,6 +20,8 @@ export class Replayer {
   private replayStartTime: number = 0;
   private session: SessionData | null = null;
 
+  public onStop?: () => void;
+
   // Async event handling
   private microtaskQueue: Function[] = [];
   private macrotaskQueue: Function[] = [];
@@ -88,6 +90,7 @@ export class Replayer {
   }
 
   stop(isFinished = false) {
+    if (!this.isReplaying) return;
     this.isReplaying = false;
     this.state.isPlaying = false;
     this.eventQueue = [];
@@ -106,14 +109,19 @@ export class Replayer {
       mode: 'IDLE'
     }, '*');
 
-    // Only signal completion to the background if we actually finished or were manually stopped
-    if ((isFinished || !window.closed) && chrome.runtime?.id) {
+    // Signal completion to the background script so it can clear the active session state.
+    // This must be sent whenever replaying stops to ensure the background script 
+    // doesn't stay in a "replaying" state.
+    if (chrome.runtime?.id) {
       chrome.runtime.sendMessage({
         action: 'REPLAY_FINISHED',
         errors: this.replayErrors
       });
     }
 
+    sessionStorage.removeItem('replayx_active');
+
+    if (this.onStop) this.onStop();
     console.log('[ReplayX Replayer] Replay stopped');
   }
 
@@ -521,9 +529,9 @@ export class Replayer {
 
     // Cleanup on stop
     const originalStop = this.stop.bind(this);
-    this.stop = () => {
+    this.stop = (isFinished?: boolean) => {
       document.removeEventListener('keydown', handler);
-      originalStop();
+      originalStop(isFinished);
     };
   }
 
