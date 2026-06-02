@@ -73,7 +73,7 @@ export class Replayer {
       source: 'replayx-content',
       action: 'SET_MODE',
       mode: 'REPLAY',
-      networkEvents: session.events.filter(e => e.type === 'Network')
+      networkEvents: session.events.filter(e => e.type === 'Network').map(e => e.payload)
     }, '*');
 
     this.createCursor();
@@ -133,13 +133,17 @@ export class Replayer {
   }
 
   private scheduleEvents(events: RecordedEvent[], currentUrl: string) {
+    const normalize = (u: string) => u.replace(/\/$/, '').toLowerCase();
+    const normalizedCurrent = normalize(currentUrl);
+
     // Filter events to only include those relevant to the current page.
-    // We skip all events that happened before the last 'Navigation' to this URL.
     let lastNavIndex = -1;
     for (let i = 0; i < events.length; i++) {
-      const payload = events[i].payload as NavigationPayload;
-      if (events[i].type === 'Navigation' && payload.url === currentUrl) {
-        lastNavIndex = i;
+      if (events[i].type === 'Navigation') {
+        const payload = events[i].payload as NavigationPayload;
+        if (normalize(payload.url) === normalizedCurrent) {
+          lastNavIndex = i;
+        }
       }
     }
 
@@ -234,15 +238,15 @@ export class Replayer {
     if (event.type !== 'Click') return;
     const payload = event.payload as ClickPayload;
     const selector = payload.selector;
-    let element = this.findElement(selector);
+    let element = await this.findElement(selector);
 
     if (!element) {
       console.warn('[ReplayX Replayer] Click target not found:', selector);
       return;
     }
 
-    // Ensure element is visible
-    element.scrollIntoView({ behavior: 'instant', block: 'center' });
+    // Ensure element is visible - 'auto' has broader support for standard DOM
+    element.scrollIntoView({ behavior: 'auto', block: 'center' });
     await this.delayMs(50);
 
     // Move cursor
@@ -278,14 +282,14 @@ export class Replayer {
     const payload = event.payload as InputPayload;
     const selector = payload.selector;
     const value = payload.value;
-    let element = this.findElement(selector) as HTMLInputElement | HTMLTextAreaElement;
+    let element = await this.findElement(selector) as HTMLInputElement | HTMLTextAreaElement;
 
     if (!element) {
       console.warn('[ReplayX Replayer] Input target not found:', selector);
       return;
     }
 
-    element.scrollIntoView({ behavior: 'instant', block: 'center' });
+    element.scrollIntoView({ behavior: 'auto', block: 'center' });
     await this.delayMs(50);
 
     this.moveCursorTo(element);
@@ -314,7 +318,7 @@ export class Replayer {
     const scrollTop = payload.scrollTop;
     const scrollLeft = payload.scrollLeft;
 
-    let element = selector === 'window' ? window : this.findElement(selector);
+    let element = selector === 'window' ? window : await this.findElement(selector);
     if (!element) return;
 
     if (element === window) {
@@ -337,8 +341,13 @@ export class Replayer {
     if (event.type !== 'Navigation') return;
     const payload = event.payload as NavigationPayload;
     const url = payload.url;
-    console.log('[ReplayX Replayer] Navigation to:', url);
-    // Navigation is handled at the session level, not per event
+    
+    // Force navigation if the app didn't transition automatically
+    const normalize = (u: string) => u.replace(/\/$/, '').toLowerCase();
+    if (normalize(window.location.href) !== normalize(url)) {
+      console.log('[ReplayX Replayer] Redirecting to next page:', url);
+      window.location.href = url;
+    }
   }
 
   private async executeResize(event: RecordedEvent) {
@@ -350,7 +359,7 @@ export class Replayer {
     if (event.type !== 'Focus') return;
     const payload = event.payload as FocusPayload;
     const selector = payload.selector;
-    let element = this.findElement(selector) as HTMLElement;
+    let element = await this.findElement(selector) as HTMLElement;
     if (element) {
       element.focus();
     }
@@ -360,24 +369,33 @@ export class Replayer {
     if (event.type !== 'Blur') return;
     const payload = event.payload as BlurPayload;
     const selector = payload.selector;
-    let element = this.findElement(selector) as HTMLElement;
+    let element = await this.findElement(selector) as HTMLElement;
     if (element) {
       element.blur();
     }
   }
 
-  private findElement(selector: string): HTMLElement | null {
-    try {
-      // Try primary selector
-      let element = document.querySelector(selector) as HTMLElement;
-      if (element) return element;
-
-      // Try alternative selectors
-      return this.tryAlternativeSelectors(selector);
-    } catch (error) {
-      console.error('[ReplayX Replayer] Error finding element:', selector, error);
-      return null;
+  private async findElement(selector: string, timeoutMs: number = 3000): Promise<HTMLElement | null> {
+    const startTime = performance.now();
+    
+    while (performance.now() - startTime < timeoutMs) {
+      try {
+        let element = document.querySelector(selector) as HTMLElement;
+        if (!element) {
+          element = this.tryAlternativeSelectors(selector);
+        }
+        
+        // Ensure element exists and is visible before returning
+        if (element && this.isElementInteractable(element)) {
+          return element;
+        }
+      } catch (e) {}
+      
+      // Wait 100ms (adjusted by speed) before retrying
+      await this.delayMs(100);
     }
+    
+    return null;
   }
 
   private tryAlternativeSelectors(originalSelector: string): HTMLElement | null {
