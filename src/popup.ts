@@ -28,8 +28,8 @@ function updateUI(updates: Partial<typeof currentState>) {
   // Recording controls
   startBtn.disabled = currentState.isRecording || currentState.isReplaying;
   stopBtn.disabled = !currentState.isRecording;
-  pauseBtn.disabled = !currentState.isRecording;
-  resumeBtn.disabled = !currentState.isRecording || !currentState.isReplaying;
+  pauseBtn.disabled = !currentState.isRecording && !currentState.isReplaying;
+  resumeBtn.disabled = !currentState.isRecording && !currentState.isReplaying;
 
   // Status
   if (currentState.isReplaying) {
@@ -175,17 +175,26 @@ stopBtn.addEventListener('click', () => {
 });
 
 pauseBtn.addEventListener('click', () => {
-  chrome.runtime.sendMessage({ action: 'PAUSE_RECORDING' }, (res) => {
+  const action = currentState.isReplaying ? 'PAUSE_REPLAY' : 'PAUSE_RECORDING';
+  chrome.runtime.sendMessage({ action }, (res) => {
     if (res && res.success) {
-      updateUI({ isRecording: false });
+      statusText.textContent = currentState.isReplaying ? 'Replay Paused' : 'Recording Paused';
+      statusText.style.color = '#ecc94b'; // Yellow for paused
     }
   });
 });
 
 resumeBtn.addEventListener('click', () => {
-  chrome.runtime.sendMessage({ action: 'RESUME_RECORDING' }, (res) => {
+  const action = currentState.isReplaying ? 'RESUME_REPLAY' : 'RESUME_RECORDING';
+  chrome.runtime.sendMessage({ action }, (res) => {
     if (res && res.success) {
-      updateUI({ isRecording: true });
+      if (currentState.isReplaying) {
+        statusText.textContent = 'Replaying...';
+        statusText.style.color = '#38a169';
+      } else {
+        statusText.textContent = 'Recording...';
+        statusText.style.color = '#e53e3e';
+      }
     }
   });
 });

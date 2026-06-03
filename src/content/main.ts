@@ -145,6 +145,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       break;
 
+    case 'PAUSE_REPLAY':
+      try {
+        replayer.pause();
+        sendResponse({ success: true });
+      } catch (error) {
+        sendResponse({ success: false, error: error.message });
+      }
+      break;
+
+    case 'RESUME_REPLAY':
+      try {
+        replayer.resume();
+        sendResponse({ success: true });
+      } catch (error) {
+        sendResponse({ success: false, error: error.message });
+      }
+      break;
+
     case 'SET_REPLAY_SPEED':
       try {
         replayer.setSpeed(message.speed);

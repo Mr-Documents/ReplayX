@@ -26,13 +26,20 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   // Handle navigation during replay
   if (changeInfo.status === 'complete' && tabId === replayTabId && activeReplaySession) {
     console.log('[ReplayX BG] Tab navigation complete, starting replay');
-    chrome.tabs.sendMessage(tabId, {
+    
+    const startMsg = {
       action: 'START_REPLAY',
       session: activeReplaySession,
       speed: replaySpeed
-    }, (res) => {
-      if (chrome.runtime.lastError) {
-        console.error('[ReplayX BG] Auto-replay start error:', chrome.runtime.lastError.message);
+    };
+
+    sendMessageToTab(tabId, startMsg).then(async (res) => {
+      if (res?.error && res.error.includes('Receiving end does not exist')) {
+        console.log('[ReplayX BG] Content script missing on navigation, injecting...');
+        await ensureContentScript(tabId);
+        await sendMessageToTab(tabId, startMsg);
+      } else if (res?.error) {
+        console.error('[ReplayX BG] Auto-replay start error:', res.error);
       }
     });
   }
@@ -115,6 +122,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'STOP_REPLAY':
       handleStopReplay(sendResponse);
       return true; // async
+
+    case 'PAUSE_REPLAY':
+      if (replayTabId) {
+        chrome.tabs.sendMessage(replayTabId, { action: 'PAUSE_REPLAY' });
+      }
+      sendResponse({ success: true });
+      break;
+
+    case 'RESUME_REPLAY':
+      if (replayTabId) {
+        chrome.tabs.sendMessage(replayTabId, { action: 'RESUME_REPLAY' });
+      }
+      sendResponse({ success: true });
+      break;
 
     case 'SET_REPLAY_SPEED':
       replaySpeed = Math.max(0.1, Math.min(10, message.speed || 1));
@@ -323,25 +344,12 @@ function handleSaveRecordingEvents(sessionId: string, events: RecordedEvent[], s
 // Replay handlers
 async function handleReplaySession(sessionId: string, speed: number, sendResponse: (response: any) => void) {
   if (activeReplaySession) {
-    // Stale session check: verify if the replay tab still exists
-    let isStale = false;
-    if (!replayTabId) {
-      isStale = true;
-    } else {
-      try {
-        await chrome.tabs.get(replayTabId);
-      } catch (e) {
-        isStale = true;
-      }
-    }
-
-    if (isStale) {
-      activeReplaySession = null;
-      replayTabId = null;
-    } else {
-      sendResponse({ success: false, error: 'Replay already in progress' });
-      return;
-    }
+    // Force stop existing replay before starting a new one
+    await new Promise((resolve) => {
+      handleStopReplay(() => resolve(null));
+    });
+    // Small delay to ensure cleanup
+    await new Promise(r => setTimeout(r, 100));
   }
 
   try {
@@ -359,12 +367,17 @@ async function handleReplaySession(sessionId: string, speed: number, sendRespons
       return;
     }
 
+    if (!tab.url || !tab.url.startsWith('http')) {
+      sendResponse({ success: false, error: 'Cannot replay on this tab type (restricted URL)' });
+      return;
+    }
+
     activeReplaySession = session;
     replayTabId = tab.id;
     replaySpeed = speed;
 
     // Check if we need to navigate
-    const currentUrl = new URL(tab.url || '');
+    const currentUrl = new URL(tab.url);
     const sessionUrl = new URL(session.url);
 
     if (currentUrl.href !== sessionUrl.href) {
@@ -374,20 +387,25 @@ async function handleReplaySession(sessionId: string, speed: number, sendRespons
       sendResponse({ success: true });
     } else {
       // Start replay immediately
-      chrome.tabs.sendMessage(tab.id, {
+      let response = await sendMessageToTab(tab.id, {
         action: 'START_REPLAY',
         session,
         speed
-      }, (res) => {
-        if (chrome.runtime.lastError) {
-          console.error('[ReplayX BG] Replay start error:', chrome.runtime.lastError.message);
-          activeReplaySession = null;
-          replayTabId = null;
-          sendResponse({ success: false, error: chrome.runtime.lastError.message });
-        } else {
-          sendResponse({ success: true });
-        }
       });
+
+      if (response?.error && response.error.includes('Receiving end does not exist')) {
+        console.log('[ReplayX BG] Content script missing, injecting...');
+        await ensureContentScript(tab.id);
+        response = await sendMessageToTab(tab.id, { action: 'START_REPLAY', session, speed });
+      }
+
+      if (response?.error) {
+        activeReplaySession = null;
+        replayTabId = null;
+        sendResponse({ success: false, error: response.error });
+      } else {
+        sendResponse({ success: true });
+      }
     }
   } catch (error) {
     console.error('[ReplayX BG] Error starting replay:', error);
