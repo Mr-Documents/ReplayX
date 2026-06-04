@@ -81,10 +81,12 @@ chrome.runtime.sendMessage({ action: 'GET_STATE' }, (state: any) => {
   if (state?.isRecording && state?.currentSessionId) {
     console.log('[ReplayX] Resuming recording after navigation or refresh');
     recorder.start(state.currentSessionId, state.recordingStartTime);
+    if (state.isPaused) recorder.pause();
     updateWidgetState(true);
   } else if (state?.activeReplaySession && !replayer['isReplaying']) {
     console.log('[ReplayX] Automatically starting replay after navigation');
     startReplaySession(state.activeReplaySession, state.replaySpeed);
+    if (state.isReplayPaused) replayer.pause();
   } else {
     updateWidgetState(false);
   }
@@ -123,6 +125,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
       } catch (error) {
         console.error('[ReplayX] Error stopping recording:', error);
+        sendResponse({ success: false, error: error.message });
+      }
+      break;
+
+    case 'PAUSE_RECORDING':
+      try {
+        recorder.pause();
+        sendResponse({ success: true });
+      } catch (error) {
+        sendResponse({ success: false, error: error.message });
+      }
+      break;
+
+    case 'RESUME_RECORDING':
+      try {
+        recorder.resume();
+        sendResponse({ success: true });
+      } catch (error) {
         sendResponse({ success: false, error: error.message });
       }
       break;

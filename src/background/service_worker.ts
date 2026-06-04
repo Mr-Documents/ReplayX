@@ -6,11 +6,13 @@ let isRecording = false;
 let currentTabId: number | null = null;
 let currentSessionId: string | null = null;
 let recordingStartTime: number = 0;
+let isPaused = false;
 
 // Replay state
 let activeReplaySession: SessionData | null = null;
 let replayTabId: number | null = null;
 let replaySpeed = 1;
+let isReplayPaused = false;
 
 // Session lifecycle management
 const sessionStates = new Map<string, {
@@ -47,6 +49,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         currentSessionId: isFromPopup ? currentSessionId : (isCurrentTabRecording ? currentSessionId : null),
         recordingStartTime: isFromPopup ? recordingStartTime : (isCurrentTabRecording ? recordingStartTime : null),
         currentTabId: isFromPopup ? currentTabId : (isCurrentTabRecording ? currentTabId : null),
+        isPaused: isFromPopup ? isPaused : (isCurrentTabRecording ? isPaused : false),
+        isReplayPaused: isFromPopup ? isReplayPaused : (replayTabId === tabId ? isReplayPaused : false),
         activeReplaySession: isFromPopup ? activeReplaySession : (replayTabId === tabId ? activeReplaySession : null),
         replaySpeed
       });
@@ -66,9 +70,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true; // async
 
     case 'PAUSE_RECORDING':
-      if (isRecording && currentSessionId) {
+      if (isRecording && currentSessionId && currentTabId) {
         sessionStates.get(currentSessionId)!.status = 'paused';
-        isRecording = false;
+        isPaused = true;
+        chrome.tabs.sendMessage(currentTabId, { action: 'PAUSE_RECORDING' });
         sendResponse({ success: true });
       } else {
         sendResponse({ success: false, error: 'Not recording' });
@@ -76,9 +81,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       break;
 
     case 'RESUME_RECORDING':
-      if (!isRecording && currentSessionId && sessionStates.get(currentSessionId)?.status === 'paused') {
+      if (isRecording && currentSessionId && currentTabId && isPaused) {
         sessionStates.get(currentSessionId)!.status = 'recording';
-        isRecording = true;
+        isPaused = false;
+        chrome.tabs.sendMessage(currentTabId, { action: 'RESUME_RECORDING' });
         sendResponse({ success: true });
       } else {
         sendResponse({ success: false, error: 'Cannot resume' });
@@ -102,6 +108,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case 'PAUSE_REPLAY':
       if (replayTabId) {
+        isReplayPaused = true;
         chrome.tabs.sendMessage(replayTabId, { action: 'PAUSE_REPLAY' });
       }
       sendResponse({ success: true });
@@ -109,6 +116,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case 'RESUME_REPLAY':
       if (replayTabId) {
+        isReplayPaused = false;
         chrome.tabs.sendMessage(replayTabId, { action: 'RESUME_REPLAY' });
       }
       sendResponse({ success: true });
@@ -141,6 +149,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       console.log('[ReplayX BG] Replay finished');
       activeReplaySession = null;
       replayTabId = null;
+      isReplayPaused = false;
       sendResponse({ success: true });
       break;
 
@@ -213,6 +222,7 @@ async function handleStartRecording(sendResponse: (response: any) => void) {
     currentSessionId = crypto.randomUUID();
     currentTabId = tab.id;
     isRecording = true;
+    isPaused = false;
     recordingStartTime = Date.now();
 
     sessionStates.set(currentSessionId, {
@@ -352,6 +362,7 @@ async function handleReplaySession(sessionId: string, speed: number, sendRespons
     activeReplaySession = session;
     replayTabId = tab.id;
     replaySpeed = speed;
+    isReplayPaused = false;
 
     // Check if we need to navigate
     const currentUrl = new URL(tab.url);
@@ -402,10 +413,12 @@ function handleStopReplay(sendResponse: (response: any) => void) {
       }
       activeReplaySession = null;
       replayTabId = null;
+      isReplayPaused = false;
       sendResponse({ success: true });
     });
   } else {
     activeReplaySession = null;
+    isReplayPaused = false;
     sendResponse({ success: true });
   }
 }
@@ -460,6 +473,7 @@ function cleanupRecording() {
   currentTabId = null;
   currentSessionId = null;
   recordingStartTime = 0;
+  isPaused = false;
 }
 
 function cleanupTabState(tabId: number) {

@@ -16,6 +16,7 @@ export class Recorder {
   private sessionId: string = '';
   private sessionStartTime: number = 0;
   private isRecording = false;
+  private isPaused = false;
   private initialState: any = null;
   private mutationObserver: MutationObserver | null = null;
   private scrollTimeout: number | null = null;
@@ -32,6 +33,7 @@ export class Recorder {
   start(sessionId: string, sessionStartTime?: number) {
     if (this.isRecording) return;
     this.isRecording = true;
+    this.isPaused = false;
     this.sessionId = sessionId;
     this.events = [];
     this.sessionStartTime = sessionStartTime ?? Date.now();
@@ -104,8 +106,18 @@ export class Recorder {
     return result;
   }
 
+  pause() {
+    this.isPaused = true;
+    console.log('[ReplayX Recorder] Recording paused');
+  }
+
+  resume() {
+    this.isPaused = false;
+    console.log('[ReplayX Recorder] Recording resumed');
+  }
+
   public addEvent(event: RecordedEvent) {
-    if (this.isRecording) {
+    if (this.isRecording && !this.isPaused) {
       this.events.push(event);
     }
   }

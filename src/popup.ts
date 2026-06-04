@@ -17,7 +17,9 @@ const progressBar = document.getElementById('progress-bar') as HTMLDivElement;
 // State
 let currentState = {
   isRecording: false,
+  isPaused: false,
   isReplaying: false,
+  isReplayPaused: false,
   replaySpeed: 1,
   sessions: [] as SessionData[]
 };
@@ -28,13 +30,29 @@ function updateUI(updates: Partial<typeof currentState>) {
   // Recording controls
   startBtn.disabled = currentState.isRecording || currentState.isReplaying;
   stopBtn.disabled = !currentState.isRecording;
-  pauseBtn.disabled = !currentState.isRecording && !currentState.isReplaying;
-  resumeBtn.disabled = !currentState.isRecording && !currentState.isReplaying;
+
+  const isAnyActive = currentState.isRecording || currentState.isReplaying;
+  const isAnyPaused = currentState.isPaused || currentState.isReplayPaused;
+
+  // Swap visibility: show Resume when paused, Pause when playing
+  pauseBtn.style.display = isAnyPaused ? 'none' : 'inline-block';
+  resumeBtn.style.display = isAnyPaused ? 'inline-block' : 'none';
+
+  pauseBtn.disabled = !isAnyActive;
+  resumeBtn.disabled = !isAnyActive;
+
+  resumeBtn.textContent = currentState.isRecording ? 'Resume Recording' : 'Resume Replay';
 
   // Status
-  if (currentState.isReplaying) {
+  if (currentState.isReplaying && currentState.isReplayPaused) {
+    statusText.textContent = 'Replay Paused';
+    statusText.style.color = '#ecc94b';
+  } else if (currentState.isReplaying) {
     statusText.textContent = 'Replaying...';
     statusText.style.color = '#38a169';
+  } else if (currentState.isRecording && currentState.isPaused) {
+    statusText.textContent = 'Recording Paused';
+    statusText.style.color = '#ecc94b';
   } else if (currentState.isRecording) {
     statusText.textContent = 'Recording...';
     statusText.style.color = '#e53e3e';
@@ -177,25 +195,14 @@ stopBtn.addEventListener('click', () => {
 pauseBtn.addEventListener('click', () => {
   const action = currentState.isReplaying ? 'PAUSE_REPLAY' : 'PAUSE_RECORDING';
   chrome.runtime.sendMessage({ action }, (res) => {
-    if (res && res.success) {
-      statusText.textContent = currentState.isReplaying ? 'Replay Paused' : 'Recording Paused';
-      statusText.style.color = '#ecc94b'; // Yellow for paused
-    }
+    if (res && res.success) loadState();
   });
 });
 
 resumeBtn.addEventListener('click', () => {
   const action = currentState.isReplaying ? 'RESUME_REPLAY' : 'RESUME_RECORDING';
   chrome.runtime.sendMessage({ action }, (res) => {
-    if (res && res.success) {
-      if (currentState.isReplaying) {
-        statusText.textContent = 'Replaying...';
-        statusText.style.color = '#38a169';
-      } else {
-        statusText.textContent = 'Recording...';
-        statusText.style.color = '#e53e3e';
-      }
-    }
+    if (res && res.success) loadState();
   });
 });
 
@@ -237,27 +244,23 @@ importInput.addEventListener('change', (e) => {
 });
 
 // Initial setup
-chrome.runtime.sendMessage({ action: 'GET_STATE' }, (state) => {
-  if (state) {
-    updateUI({
-      isRecording: state.isRecording || false,
-      isReplaying: !!state.activeReplaySession,
-      replaySpeed: state.replaySpeed || 1
-    });
-  }
-});
-
-loadSessions();
-
-// Periodic state updates to handle popup reloads or missed messages
-setInterval(() => {
+function loadState() {
   chrome.runtime.sendMessage({ action: 'GET_STATE' }, (state) => {
     if (state) {
       updateUI({
         isRecording: state.isRecording || false,
+        isPaused: state.isPaused || false,
         isReplaying: !!state.activeReplaySession,
+        isReplayPaused: state.isReplayPaused || false,
         replaySpeed: state.replaySpeed || 1
       });
     }
   });
-}, 1000);
+}
+
+// Initial setup
+loadState();
+loadSessions();
+
+// Periodic state updates
+setInterval(loadState, 1000);
