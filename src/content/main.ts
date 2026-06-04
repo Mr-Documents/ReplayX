@@ -70,17 +70,21 @@ function updateWidgetState(isRecording: boolean, isReplaying: boolean = false) {
 }
 
 // Check initial state from background in case of page refresh or navigation
-chrome.runtime.sendMessage({ action: 'GET_STATE' }, (state) => {
+chrome.runtime.sendMessage({ action: 'GET_STATE' }, (state: any) => {
+  if (chrome.runtime.lastError) {
+    console.warn('[ReplayX] Could not connect to background script:', chrome.runtime.lastError.message);
+    return;
+  }
+
   createWidget();
 
   if (state?.isRecording && state?.currentSessionId) {
     console.log('[ReplayX] Resuming recording after navigation or refresh');
     recorder.start(state.currentSessionId, state.recordingStartTime);
     updateWidgetState(true);
-  } else if (state?.activeReplaySession) {
+  } else if (state?.activeReplaySession && !replayer['isReplaying']) {
     console.log('[ReplayX] Automatically starting replay after navigation');
-    updateWidgetState(false, true);
-    replayer.start(state.activeReplaySession, { speed: state.replaySpeed || 1 });
+    startReplaySession(state.activeReplaySession, state.replaySpeed);
   } else {
     updateWidgetState(false);
   }
@@ -93,10 +97,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       try {
         recorder.start(message.sessionId);
         updateWidgetState(true);
+        const startTime = recorder.getSessionStartTime();
         sendResponse({
           success: true,
           url: window.location.href,
-          startTime: Date.now()
+          startTime
         });
       } catch (error) {
         console.error('[ReplayX] Error starting recording:', error);
@@ -124,8 +129,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case 'START_REPLAY':
       try {
-        updateWidgetState(false, true);
-        replayer.start(message.session, { speed: message.speed || 1 });
+        startReplaySession(message.session, message.speed);
         sendResponse({ success: true });
       } catch (error) {
         console.error('[ReplayX] Error starting replay:', error);
@@ -178,13 +182,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
+/**
+ * Shared helper to start replay and update UI
+ */
+function startReplaySession(session: SessionData, speed: number) {
+  updateWidgetState(false, true);
+  replayer.start(session, { speed: speed || 1 });
+}
+
 // Handle network events from interceptor
 window.addEventListener('message', (event) => {
   if (event.data && event.data.source === 'replayx-interceptor' && event.data.type === 'Network') {
     // Forward network events to recorder
     recorder.addEvent({
       id: crypto.randomUUID(),
-      sessionId: recorder['sessionId'] || 'unknown', // Access private property for now
+      sessionId: recorder.getSessionId() || 'unknown',
       type: 'Network',
       timestamp: event.data.timestamp,
       payload: {

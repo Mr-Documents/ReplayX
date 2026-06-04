@@ -23,31 +23,8 @@ const sessionStates = new Map<string, {
 
 // Tab lifecycle listeners
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  // Handle navigation during replay
-  if (changeInfo.status === 'complete' && tabId === replayTabId && activeReplaySession) {
-    console.log('[ReplayX BG] Tab navigation complete, starting replay');
-    
-    const startMsg = {
-      action: 'START_REPLAY',
-      session: activeReplaySession,
-      speed: replaySpeed
-    };
-
-    sendMessageToTab(tabId, startMsg).then(async (res) => {
-      if (res?.error && res.error.includes('Receiving end does not exist')) {
-        console.log('[ReplayX BG] Content script missing on navigation, injecting...');
-        await ensureContentScript(tabId);
-        await sendMessageToTab(tabId, startMsg);
-      } else if (res?.error) {
-        console.error('[ReplayX BG] Auto-replay start error:', res.error);
-      }
-    });
-  }
-
-  // Handle tab close during recording/replay
-  if (changeInfo.status === 'complete' && !tab) {
-    cleanupTabState(tabId);
-  }
+  // Navigation is now driven by the content script "pulling" state via GET_STATE 
+  // on load, which is more reliable than pushing state from here.
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -70,7 +47,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         currentSessionId: isFromPopup ? currentSessionId : (isCurrentTabRecording ? currentSessionId : null),
         recordingStartTime: isFromPopup ? recordingStartTime : (isCurrentTabRecording ? recordingStartTime : null),
         currentTabId: isFromPopup ? currentTabId : (isCurrentTabRecording ? currentTabId : null),
-        activeReplaySession: (replayTabId && tabId === replayTabId) ? activeReplaySession : null,
+        activeReplaySession: isFromPopup ? activeReplaySession : (replayTabId === tabId ? activeReplaySession : null),
         replaySpeed
       });
       break;

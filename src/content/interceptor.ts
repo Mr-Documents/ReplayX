@@ -9,10 +9,6 @@
   let replayNetworkEvents: any[] = [];
   let replayIndex = 0;
 
-  // Event queue for deterministic replay
-  let eventQueue: Array<{ type: 'microtask' | 'macrotask', callback: Function }> = [];
-  let isProcessingQueue = false;
-
   window.addEventListener('message', (event) => {
     if (event.data && event.data.source === 'replayx-content') {
       if (event.data.action === 'SET_MODE') {
@@ -194,16 +190,29 @@
 
   // Helper functions
   function findMatchingNetworkEvent(method: string, url: string): any {
-    // Simple URL matching - in production, could use more sophisticated matching
-    return replayNetworkEvents.find(event =>
-      event.method === method &&
-      (url === event.url || url.includes(event.url) || event.url.includes(url))
+    const fullUrl = new URL(url, window.location.href).href;
+    
+    // 1. Try exact match first
+    let match = replayNetworkEvents.find(event => 
+      event.method === method && event.url === fullUrl
     );
+
+    // 2. Fallback to fuzzy match (ignoring query params/hashes)
+    if (!match) {
+      const cleanUrl = fullUrl.split(/[?#]/)[0];
+      match = replayNetworkEvents.find(event => {
+        const cleanEventUrl = event.url.split(/[?#]/)[0];
+        return event.method === method && cleanEventUrl === cleanUrl;
+      });
+    }
+
+    return match;
   }
 
   function createMockResponse(event: any): Response {
     return new Response(event.responseBody, {
       status: event.responseStatus,
+      statusText: 'OK',
       headers: event.responseHeaders
     });
   }
@@ -218,11 +227,28 @@
     // Simulate readyState changes
     Object.defineProperty(xhr, 'readyState', { value: XMLHttpRequest.DONE, writable: false });
 
+    // Mock header methods essential for response parsing logic in libraries like Axios
+    xhr.getAllResponseHeaders = function() {
+      return Object.entries(event.responseHeaders || {})
+        .map(([key, value]) => `${key}: ${value}`)
+        .join('\r\n') + '\r\n';
+    };
+
+    xhr.getResponseHeader = function(header: string) {
+      const headers = event.responseHeaders || {};
+      const key = Object.keys(headers).find(k => k.toLowerCase() === header.toLowerCase());
+      return key ? headers[key] : null;
+    };
+
     // Trigger events asynchronously to match real XHR behavior
     setTimeout(() => {
+      // Dispatch via event system for addEventListener support
+      xhr.dispatchEvent(new Event('readystatechange'));
       if (xhr.onreadystatechange) {
         xhr.onreadystatechange(new Event('readystatechange'));
       }
+
+      xhr.dispatchEvent(new Event('load'));
       if (xhr.onload) {
         xhr.onload(new ProgressEvent('load', { lengthComputable: false, loaded: 0, total: 0 }));
       }
@@ -251,12 +277,16 @@
   async function extractRequestBody(input: RequestInfo | URL, init?: RequestInit): Promise<string | undefined> {
     if (init?.body) {
       if (typeof init.body === 'string') return init.body;
+      if (init.body instanceof URLSearchParams) return init.body.toString();
       if (init.body instanceof FormData) {
         const data: Record<string, string> = {};
         for (const [key, value] of init.body.entries()) {
           data[key] = value.toString();
         }
         return JSON.stringify(data);
+      }
+      if (init.body instanceof Blob) {
+        return await init.body.text();
       }
     }
     return undefined;

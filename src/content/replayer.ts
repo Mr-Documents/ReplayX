@@ -19,6 +19,7 @@ export class Replayer {
   private cursor: HTMLElement | null = null;
   private replayStartTime: number = 0;
   private session: SessionData | null = null;
+  private startIndex: number = 0;
 
   public onStop?: () => void;
 
@@ -29,6 +30,8 @@ export class Replayer {
 
   // Error tracking
   private replayErrors: Array<{ event: RecordedEvent; error: string }> = [];
+
+  private boundUnloadHandler = () => this.stop(false);
 
   async start(session: SessionData & { initialState?: any }, options: { speed?: number } = {}) {
     if (this.isReplaying) return;
@@ -79,7 +82,8 @@ export class Replayer {
     }, '*');
 
     this.createCursor();
-    this.scheduleEvents(session.events, window.location.href);
+    this.scheduleEvents(session.events);
+    window.addEventListener('beforeunload', this.boundUnloadHandler);
 
     // Start replay loop
     this.state.isPlaying = true;
@@ -94,6 +98,7 @@ export class Replayer {
     this.isReplaying = false;
     this.state.isPlaying = false;
     this.eventQueue = [];
+    window.removeEventListener('beforeunload', this.boundUnloadHandler);
     this.microtaskQueue = [];
     this.macrotaskQueue = [];
 
@@ -112,14 +117,16 @@ export class Replayer {
     // Signal completion to the background script so it can clear the active session state.
     // This must be sent whenever replaying stops to ensure the background script 
     // doesn't stay in a "replaying" state.
-    if (chrome.runtime?.id) {
+    if (isFinished && chrome.runtime?.id) {
       chrome.runtime.sendMessage({
         action: 'REPLAY_FINISHED',
         errors: this.replayErrors
       });
+      sessionStorage.removeItem('replayx_active');
+      sessionStorage.removeItem('replayx_event_index');
+    } else if (!isFinished) {
+      // Don't remove replayx_active if we are just navigating
     }
-
-    sessionStorage.removeItem('replayx_active');
 
     if (this.onStop) this.onStop();
     console.log('[ReplayX Replayer] Replay stopped');
@@ -140,26 +147,17 @@ export class Replayer {
     console.log('[ReplayX Replayer] Speed set to:', this.state.speed);
   }
 
-  private scheduleEvents(events: RecordedEvent[], currentUrl: string) {
-    const normalize = (u: string) => u.replace(/\/$/, '').toLowerCase();
-    const normalizedCurrent = normalize(currentUrl);
+  private scheduleEvents(events: RecordedEvent[]) {
+    // Use index-based tracking to handle multiple visits to the same URL correctly
+    const savedIndex = sessionStorage.getItem('replayx_event_index');
+    this.startIndex = savedIndex ? parseInt(savedIndex, 10) : 0;
 
-    // Filter events to only include those relevant to the current page.
-    let lastNavIndex = -1;
-    for (let i = 0; i < events.length; i++) {
-      if (events[i].type === 'Navigation') {
-        const payload = events[i].payload as NavigationPayload;
-        if (normalize(payload.url) === normalizedCurrent) {
-          lastNavIndex = i;
-        }
-      }
-    }
-
-    const eventsToSchedule = lastNavIndex !== -1 ? events.slice(lastNavIndex) : events;
+    const eventsToSchedule = events.slice(this.startIndex);
     const offset = eventsToSchedule.length > 0 ? eventsToSchedule[0].timestamp : 0;
 
     this.eventQueue = eventsToSchedule.map(event => ({
       event,
+      // scheduledTime is now relative to the current page load
       scheduledTime: event.timestamp - offset,
       executed: false
     })).sort((a, b) => a.scheduledTime - b.scheduledTime);
@@ -184,16 +182,22 @@ export class Replayer {
              this.eventQueue[this.nextEventIndex].scheduledTime <= currentTime) {
         const item = this.eventQueue[this.nextEventIndex];
         try {
-          await this.executeEvent(item.event);
+          const navigationTriggered = await this.executeEvent(item.event);
           item.executed = true;
+          this.nextEventIndex += 1;
+          
+          // Persist progress across reloads
+          sessionStorage.setItem('replayx_event_index', (this.startIndex + this.nextEventIndex).toString());
+
+          if (navigationTriggered) {
+            this.stop(false); // Stop local loop but keep background session active
+            return;
+          }
         } catch (error) {
           console.error('[ReplayX Replayer] Event execution failed:', item.event, error);
-          this.replayErrors.push({
-            event: item.event,
-            error: error instanceof Error ? error.message : String(error)
-          });
+          this.replayErrors.push({ event: item.event, error: String(error) });
+          this.nextEventIndex += 1;
         }
-        this.nextEventIndex += 1;
       }
 
       // Process async queues
@@ -211,32 +215,24 @@ export class Replayer {
     }
   }
 
-  private async executeEvent(event: RecordedEvent) {
+  private async executeEvent(event: RecordedEvent): Promise<boolean | void> {
     switch (event.type) {
       case 'Click':
-        await this.executeClick(event);
-        break;
+        return await this.executeClick(event);
       case 'Input':
-        await this.executeInput(event);
-        break;
+        return await this.executeInput(event);
       case 'Scroll':
-        await this.executeScroll(event);
-        break;
+        return await this.executeScroll(event);
       case 'Mutation':
-        await this.executeMutation(event);
-        break;
+        return await this.executeMutation(event);
       case 'Navigation':
-        await this.executeNavigation(event);
-        break;
+        return await this.executeNavigation(event);
       case 'Resize':
-        await this.executeResize(event);
-        break;
+        return await this.executeResize(event);
       case 'Focus':
-        await this.executeFocus(event);
-        break;
+        return await this.executeFocus(event);
       case 'Blur':
-        await this.executeBlur(event);
-        break;
+        return await this.executeBlur(event);
       default:
         console.warn('[ReplayX Replayer] Unknown event type:', event.type);
     }
@@ -355,7 +351,9 @@ export class Replayer {
     if (normalize(window.location.href) !== normalize(url)) {
       console.log('[ReplayX Replayer] Redirecting to next page:', url);
       window.location.href = url;
+      return true;
     }
+    return false;
   }
 
   private async executeResize(event: RecordedEvent) {

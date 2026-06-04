@@ -54,8 +54,12 @@ export class Recorder {
     document.addEventListener('blur', this.boundBlurHandler, true);
 
     // Navigation events
-    window.addEventListener('popstate', this.boundNavigationHandler);
-    window.addEventListener('pushstate', this.boundNavigationHandler); // Custom event if needed
+    this.setupNavigationTracking();
+
+    // If resuming after a reload, record the current location immediately
+    if (sessionStartTime) {
+      this.onNavigation();
+    }
 
     // Mutation observer for DOM changes
     this.setupMutationObserver();
@@ -75,7 +79,7 @@ export class Recorder {
     window.removeEventListener('resize', this.boundResizeHandler);
     document.removeEventListener('focus', this.boundFocusHandler, true);
     document.removeEventListener('blur', this.boundBlurHandler, true);
-    window.removeEventListener('popstate', this.boundNavigationHandler);
+    this.cleanupNavigationTracking();
 
     // Disconnect mutation observer
     if (this.mutationObserver) {
@@ -243,7 +247,7 @@ export class Recorder {
     });
   }
 
-  private onNavigation(e: Event) {
+  private onNavigation(e?: Event) {
     this.addEvent({
       id: crypto.randomUUID(),
       sessionId: this.sessionId,
@@ -254,6 +258,38 @@ export class Recorder {
         referrer: document.referrer
       }
     });
+  }
+
+  private setupNavigationTracking() {
+    window.addEventListener('popstate', this.boundNavigationHandler);
+    window.addEventListener('hashchange', this.boundNavigationHandler);
+
+    // Monkey-patch History API to detect SPA transitions
+    const recorder = this;
+    const originalPushState = history.pushState;
+    const originalReplaceState = history.replaceState;
+
+    history.pushState = function(...args) {
+      originalPushState.apply(this, args);
+      recorder.onNavigation();
+    };
+
+    history.replaceState = function(...args) {
+      originalReplaceState.apply(this, args);
+      recorder.onNavigation();
+    };
+
+    (this as any)._originalPushState = originalPushState;
+    (this as any)._originalReplaceState = originalReplaceState;
+  }
+
+  private cleanupNavigationTracking() {
+    window.removeEventListener('popstate', this.boundNavigationHandler);
+    window.removeEventListener('hashchange', this.boundNavigationHandler);
+    if ((this as any)._originalPushState) {
+      history.pushState = (this as any)._originalPushState;
+      history.replaceState = (this as any)._originalReplaceState;
+    }
   }
 
   private setupMutationObserver() {
