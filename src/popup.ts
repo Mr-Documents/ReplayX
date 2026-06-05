@@ -34,9 +34,12 @@ function updateUI(updates: Partial<typeof currentState>) {
   const isAnyActive = currentState.isRecording || currentState.isReplaying;
   const isAnyPaused = currentState.isPaused || currentState.isReplayPaused;
 
-  // Swap visibility: show Resume when paused, Pause when playing
-  pauseBtn.style.display = isAnyPaused ? 'none' : 'inline-block';
-  resumeBtn.style.display = isAnyPaused ? 'inline-block' : 'none';
+  // Swap visibility: show Resume when active AND paused, Pause when active AND NOT paused
+  const showResume = isAnyActive && isAnyPaused;
+  const showPause = isAnyActive && !isAnyPaused;
+
+  pauseBtn.style.display = showPause ? 'inline-block' : 'none';
+  resumeBtn.style.display = showResume ? 'inline-block' : 'none';
 
   pauseBtn.disabled = !isAnyActive;
   resumeBtn.disabled = !isAnyActive;

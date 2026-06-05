@@ -43,6 +43,9 @@ export class Replayer {
 
     // Check if we are starting from scratch or resuming after a navigation
     const isResuming = sessionStorage.getItem('replayx_active') === 'true';
+    if (!isResuming) {
+      sessionStorage.setItem('replayx_event_index', '0');
+    }
 
     // MVP Improvement: Restore Initial State only on the first page of the session
     if (session.initialState && !isResuming) {
@@ -272,13 +275,12 @@ export class Replayer {
       clientY: rect.top + rect.height / 2
     };
 
-    element.dispatchEvent(new MouseEvent('mouseenter', eventOptions));
-    await this.delayMs(10);
     element.dispatchEvent(new MouseEvent('mousedown', eventOptions));
-    await this.delayMs(10);
+    await this.delayMs(20);
     element.dispatchEvent(new MouseEvent('mouseup', eventOptions));
-    await this.delayMs(10);
-    element.dispatchEvent(new MouseEvent('click', eventOptions));
+    
+    // Use native click() as it triggers both the event and the default browser action
+    element.click();
   }
 
   private async executeInput(event: RecordedEvent) {
@@ -308,11 +310,14 @@ export class Replayer {
     element.focus();
     await this.delayMs(50);
 
-    // Set value and dispatch events
-    element.value = value;
-    element.dispatchEvent(new Event('input', { bubbles: true }));
-    await this.delayMs(50);
-    element.dispatchEvent(new Event('change', { bubbles: true }));
+    // Set value and dispatch standard events to trigger framework state updates
+    if (element.value !== value) {
+      element.value = value;
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+      element.dispatchEvent(new Event('change', { bubbles: true }));
+      // Trigger blur as some apps only save on loss of focus
+      element.dispatchEvent(new Event('blur', { bubbles: true }));
+    }
   }
 
   private async executeScroll(event: RecordedEvent) {
