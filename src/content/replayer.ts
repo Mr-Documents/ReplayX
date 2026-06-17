@@ -96,6 +96,10 @@ export class Replayer {
     this.setupKeyboardControls();
   }
 
+  public isActive(): boolean {
+    return this.isReplaying;
+  }
+
   stop(isFinished = false) {
     if (!this.isReplaying) return;
     this.isReplaying = false;

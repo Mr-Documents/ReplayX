@@ -161,7 +161,7 @@ export class Recorder {
     const rect = target.getBoundingClientRect();
 
     this.addEvent({
-      id: crypto.randomUUID(),
+      id: this.generateId(),
       sessionId: this.sessionId,
       timestamp: this.getTimestamp(),
       type: 'Click',
@@ -175,19 +175,24 @@ export class Recorder {
   }
 
   private onInput(e: Event) {
-    const target = e.target as HTMLInputElement | HTMLTextAreaElement;
+    const target = e.target as HTMLElement;
     const selector = this.getRobustSelector(target);
     
+    // Handle different input types (Input, TextArea, Select)
+    const value = (target as HTMLInputElement).value !== undefined 
+      ? (target as HTMLInputElement).value 
+      : target.innerText;
+
     // MVP Improvement: Basic Privacy Masking
-    let value = target.value;
-    const isSensitive = target.type === 'password' || 
-                        target.name.toLowerCase().includes('card') ||
+    let maskedValue = value;
+    const isSensitive = (target as HTMLInputElement).type === 'password' || 
+                        (target as HTMLInputElement).name?.toLowerCase().includes('card') ||
                         target.hasAttribute('data-replay-mask');
     
-    if (isSensitive) value = '********';
+    if (isSensitive) maskedValue = '********';
 
     this.addEvent({
-      id: crypto.randomUUID(),
+      id: this.generateId(),
       sessionId: this.sessionId,
       timestamp: this.getTimestamp(),
       type: 'Input',
@@ -207,7 +212,7 @@ export class Recorder {
     if (this.scrollTimeout) clearTimeout(this.scrollTimeout);
     this.scrollTimeout = window.setTimeout(() => {
       this.addEvent({
-        id: crypto.randomUUID(),
+        id: this.generateId(),
         sessionId: this.sessionId,
         timestamp: this.getTimestamp(),
         type: 'Scroll',
@@ -222,7 +227,7 @@ export class Recorder {
 
   private onResize() {
     this.addEvent({
-      id: crypto.randomUUID(),
+      id: this.generateId(),
       sessionId: this.sessionId,
       timestamp: this.getTimestamp(),
       type: 'Resize',
@@ -238,7 +243,7 @@ export class Recorder {
     const selector = this.getRobustSelector(target);
 
     this.addEvent({
-      id: crypto.randomUUID(),
+      id: this.generateId(),
       sessionId: this.sessionId,
       timestamp: this.getTimestamp(),
       type: 'Focus',
@@ -251,7 +256,7 @@ export class Recorder {
     const selector = this.getRobustSelector(target);
 
     this.addEvent({
-      id: crypto.randomUUID(),
+      id: this.generateId(),
       sessionId: this.sessionId,
       timestamp: this.getTimestamp(),
       type: 'Blur',
@@ -261,7 +266,7 @@ export class Recorder {
 
   private onNavigation(e?: Event) {
     this.addEvent({
-      id: crypto.randomUUID(),
+      id: this.generateId(),
       sessionId: this.sessionId,
       timestamp: this.getTimestamp(),
       type: 'Navigation',
@@ -272,25 +277,37 @@ export class Recorder {
     });
   }
 
+  private generateId(): string {
+    // Fallback for non-HTTPS sites where crypto.randomUUID is unavailable
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+      return crypto.randomUUID();
+    }
+    return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+  }
+
   private setupNavigationTracking() {
     window.addEventListener('popstate', this.boundNavigationHandler);
     window.addEventListener('hashchange', this.boundNavigationHandler);
 
     // Monkey-patch History API to detect SPA transitions
+    // Guard against multiple patches if the script is re-injected
+    if ((history.pushState as any)._isReplayXPatched) return;
+
     const recorder = this;
     const originalPushState = history.pushState;
     const originalReplaceState = history.replaceState;
 
-    history.pushState = function(...args) {
+    history.pushState = function(...args: any[]) {
       originalPushState.apply(this, args);
       recorder.onNavigation();
     };
 
-    history.replaceState = function(...args) {
+    history.replaceState = function(...args: any[]) {
       originalReplaceState.apply(this, args);
       recorder.onNavigation();
     };
 
+    (history.pushState as any)._isReplayXPatched = true;
     (this as any)._originalPushState = originalPushState;
     (this as any)._originalReplaceState = originalReplaceState;
   }
@@ -352,7 +369,7 @@ export class Recorder {
         }
 
         this.addEvent({
-          id: crypto.randomUUID(),
+          id: this.generateId(),
           sessionId: this.sessionId,
           timestamp: this.getTimestamp(),
           ...mutationEvent

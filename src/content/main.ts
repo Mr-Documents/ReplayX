@@ -12,7 +12,9 @@ replayer.onStop = () => updateWidgetState(false);
 let widget: HTMLDivElement | null = null;
 
 function createWidget() {
-  if (widget) return;
+  // Guard: Ensure body exists and widget isn't already there
+  if (widget || !document.body) return;
+
   widget = document.createElement('div');
   widget.id = 'replayx-widget';
   widget.style.position = 'fixed';
@@ -83,7 +85,7 @@ chrome.runtime.sendMessage({ action: 'GET_STATE' }, (state: any) => {
     recorder.start(state.currentSessionId, state.recordingStartTime);
     if (state.isPaused) recorder.pause();
     updateWidgetState(true);
-  } else if (state?.activeReplaySession && !replayer['isReplaying']) {
+  } else if (state?.activeReplaySession && !replayer.isActive()) {
     console.log('[ReplayX] Automatically starting replay after navigation');
     startReplaySession(state.activeReplaySession, state.replaySpeed);
     if (state.isReplayPaused) replayer.pause();
@@ -215,7 +217,12 @@ window.addEventListener('message', (event) => {
   if (event.data && event.data.source === 'replayx-interceptor' && event.data.type === 'Network') {
     // Forward network events to recorder
     recorder.addEvent({
-      id: crypto.randomUUID(),
+      id: (function() {
+        if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+          return crypto.randomUUID();
+        }
+        return Math.random().toString(36).substring(2);
+      })(),
       sessionId: recorder.getSessionId() || 'unknown',
       type: 'Network',
       timestamp: event.data.timestamp,
