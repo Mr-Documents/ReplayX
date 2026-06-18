@@ -2,6 +2,10 @@
 // Handles fetch and XMLHttpRequest interception for recording and replay
 
 (function() {
+  // Guard: Prevent double-initialization
+  if ((window as any)._replayx_interceptor_loaded) return;
+  (window as any)._replayx_interceptor_loaded = true;
+
   const originalFetch = window.fetch;
   const originalXHR = window.XMLHttpRequest;
 
@@ -30,8 +34,12 @@
     const method = (init?.method || (input instanceof Request ? input.method : 'GET')).toUpperCase();
 
     if (mode === 'REPLAY') {
+      // Match on body as well for deterministic replay of mutations (POST/GraphQL)
+      const requestBody = await extractRequestBody(input, init);
+      
       // Find matching network event for replay
-      const mockEvent = findMatchingNetworkEvent(method, url);
+      const mockEvent = findMatchingNetworkEvent(method, url, requestBody);
+      
       if (mockEvent) {
         console.log(`[ReplayX] Mocking fetch: ${method} ${url}`);
         return createMockResponse(mockEvent);
@@ -139,7 +147,8 @@
 
     if (mode === 'REPLAY') {
       // Mock XHR response
-      const mockEvent = findMatchingNetworkEvent(instance.method, instance.url);
+      const mockEvent = findMatchingNetworkEvent(instance.method, instance.url, instance.requestBody);
+      
       if (mockEvent) {
         console.log(`[ReplayX] Mocking XHR: ${instance.method} ${instance.url}`);
         mockXHRResponse(xhr, mockEvent);
@@ -191,23 +200,29 @@
   };
 
   // Helper functions
-  function findMatchingNetworkEvent(method: string, url: string): any {
+  function findMatchingNetworkEvent(method: string, url: string, body?: any): any {
     const fullUrl = new URL(url, window.location.href).href;
+    const isMutation = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method);
     
-    // 1. Try exact match first
-    let match = replayNetworkEvents.find(event => 
-      event.method === method && event.url === fullUrl
+    let match = replayNetworkEvents.find(event =>
+      !consumedEventIds.has(event.id) && 
+      event.method === method && 
+      event.url === fullUrl &&
+      (!isMutation || !body || event.requestBody === body)
     );
 
-    // 2. Fallback to fuzzy match (ignoring query params/hashes)
     if (!match) {
       const cleanUrl = fullUrl.split(/[?#]/)[0];
       match = replayNetworkEvents.find(event => {
+        if (consumedEventIds.has(event.id)) return false;
         const cleanEventUrl = event.url.split(/[?#]/)[0];
-        return event.method === method && cleanEventUrl === cleanUrl;
+        return event.method === method && 
+               cleanEventUrl === cleanUrl &&
+               (!isMutation || !body || event.requestBody === body);
       });
     }
 
+    if (match) consumedEventIds.add(match.id);
     return match;
   }
 
@@ -222,9 +237,20 @@
   function mockXHRResponse(xhr: XMLHttpRequest, event: any) {
     // Simulate XHR events for mocking
     Object.defineProperty(xhr, 'status', { value: event.responseStatus, writable: false });
-    Object.defineProperty(xhr, 'statusText', { value: 'OK', writable: false });
+    Object.defineProperty(xhr, 'statusText', { value: event.responseStatus >= 400 ? 'Error' : 'OK', writable: false });
+    
+    // Handle Response based on expected responseType
+    let responseValue = event.responseBody;
+    if (xhr.responseType === 'json') {
+      try {
+        responseValue = JSON.parse(event.responseBody);
+      } catch (e) {
+        console.error('[ReplayX] Failed to parse mock JSON response', e);
+      }
+    }
+
     Object.defineProperty(xhr, 'responseText', { value: event.responseBody, writable: false });
-    Object.defineProperty(xhr, 'response', { value: event.responseBody, writable: false });
+    Object.defineProperty(xhr, 'response', { value: responseValue, writable: false });
 
     // Simulate readyState changes
     Object.defineProperty(xhr, 'readyState', { value: XMLHttpRequest.DONE, writable: false });
@@ -277,6 +303,14 @@
   }
 
   async function extractRequestBody(input: RequestInfo | URL, init?: RequestInit): Promise<string | undefined> {
+    // Handle Request object when init.body is empty (common in many libraries)
+    if (input instanceof Request && !init?.body) {
+      try {
+        const cloned = input.clone();
+        return await cloned.text();
+      } catch (e) { return undefined; }
+    }
+
     if (init?.body) {
       if (typeof init.body === 'string') return init.body;
       if (init.body instanceof URLSearchParams) return init.body.toString();
@@ -289,6 +323,9 @@
       }
       if (init.body instanceof Blob) {
         return await init.body.text();
+      }
+      if (init.body instanceof ArrayBuffer) {
+        return new TextDecoder().decode(init.body);
       }
     }
     return undefined;

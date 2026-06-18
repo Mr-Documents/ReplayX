@@ -117,11 +117,12 @@ export class Recorder {
   }
 
   public addEvent(event: RecordedEvent) {
-    // Prevent feedback loop: don't record events triggered by our own replayer
-    if ((window as any)._replayx_is_replaying) {
-      return;
-    }
+    // Guard 1: Prevent recording events triggered by the replayer
+    if ((window as any)._replayx_is_replaying) return;
+
     if (this.isRecording && !this.isPaused) {
+      // Guard 2: Tag the event with the current frame's URL for deterministic replay
+      event.payload.frameUrl = window.location.href;
       this.events.push(event);
     }
   }
@@ -181,17 +182,26 @@ export class Recorder {
   private onInput(e: Event) {
     const target = e.target as HTMLElement;
     const selector = this.getRobustSelector(target);
+    const inputTarget = target as HTMLInputElement;
     
-    // Handle different input types (Input, TextArea, Select)
-    const value = (target as HTMLInputElement).value !== undefined 
-      ? (target as HTMLInputElement).value 
-      : target.innerText;
+    // Handle specialized input types
+    let value: string;
+    if (inputTarget.type === 'checkbox' || inputTarget.type === 'radio') {
+      value = String(inputTarget.checked);
+    } else if (target.hasAttribute('contenteditable')) {
+      value = target.innerText;
+    } else {
+      value = inputTarget.value || '';
+    }
 
     // MVP Improvement: Basic Privacy Masking
     let maskedValue = value;
-    const isSensitive = (target as HTMLInputElement).type === 'password' || 
-                        (target as HTMLInputElement).name?.toLowerCase().includes('card') ||
-                        target.hasAttribute('data-replay-mask');
+    // Only mask text-based inputs. Checkboxes and Radios use "true"/"false" as value; 
+    // masking them breaks the replay state.
+    const isSensitive = ((target as HTMLInputElement).type === 'password' || 
+                        target.getAttribute('name')?.toLowerCase().includes('card') ||
+                        target.hasAttribute('data-replay-mask')) &&
+                        !['checkbox', 'radio'].includes((target as HTMLInputElement).type);
     
     if (isSensitive) maskedValue = '********';
 
@@ -209,7 +219,9 @@ export class Recorder {
   }
 
   private onScroll(e: Event) {
-    const target = e.target as HTMLElement;
+    // Normalize target for window-level scrolling
+    const target = e.target === document ? (document.scrollingElement || document.documentElement) : (e.target as HTMLElement);
+    
     const selector = this.getRobustSelector(target);
 
     // Debounce scroll events

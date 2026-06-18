@@ -40,6 +40,9 @@ export class Replayer {
     this.state.speed = options.speed || 1;
     this.replayStartTime = performance.now();
     this.replayErrors = [];
+    
+    // Set global flag to prevent recorder from capturing replayed events
+    (window as any)._replayx_is_replaying = true;
 
     // Check if we are starting from scratch or resuming after a navigation
     const isResuming = sessionStorage.getItem('replayx_active') === 'true';
@@ -81,7 +84,10 @@ export class Replayer {
       source: 'replayx-content',
       action: 'SET_MODE',
       mode: 'REPLAY',
-      networkEvents: session.events.filter(e => e.type === 'Network').map(e => e.payload)
+      networkEvents: session.events.filter(e => e.type === 'Network').map(e => ({
+        id: e.id,
+        ...e.payload
+      }))
     }, '*');
 
     this.createCursor();
@@ -105,6 +111,7 @@ export class Replayer {
     this.isReplaying = false;
     this.state.isPlaying = false;
     this.eventQueue = [];
+    (window as any)._replayx_is_replaying = false;
     window.removeEventListener('beforeunload', this.boundUnloadHandler);
     this.microtaskQueue = [];
     this.macrotaskQueue = [];
@@ -152,6 +159,10 @@ export class Replayer {
   setSpeed(speed: number) {
     this.state.speed = Math.max(0.1, Math.min(10, speed));
     console.log('[ReplayX Replayer] Speed set to:', this.state.speed);
+    // Dynamically adjust cursor transition to match replay speed
+    if (this.cursor) {
+      this.cursor.style.transition = `all ${0.2 / this.state.speed}s ease-out`;
+    }
   }
 
   private scheduleEvents(events: RecordedEvent[]) {
@@ -188,6 +199,17 @@ export class Replayer {
              !this.eventQueue[this.nextEventIndex].executed &&
              this.eventQueue[this.nextEventIndex].scheduledTime <= currentTime) {
         const item = this.eventQueue[this.nextEventIndex];
+        
+        // Frame Safety: Only execute events that belong to THIS frame
+        if (item.event.payload.frameUrl) {
+          const normalize = (u: string) => u.split('#')[0].replace(/\/$/, '').toLowerCase();
+          if (normalize(item.event.payload.frameUrl) !== normalize(window.location.href)) {
+            item.executed = true;
+            this.nextEventIndex += 1;
+            continue;
+          }
+        }
+
         try {
           const navigationTriggered = await this.executeEvent(item.event);
           item.executed = true;
@@ -264,19 +286,12 @@ export class Replayer {
     this.moveCursorTo(element);
     await this.delayMs(100);
 
-    // Check if element is interactable
-    if (!this.isElementInteractable(element)) {
-      console.warn('[ReplayX Replayer] Element not interactable:', selector);
-      return;
-    }
-
-    // Dispatch mouse events in correct order
-    const rect = element.getBoundingClientRect();
+    // Use exact recorded coordinates for maximum fidelity
     const eventOptions = {
       bubbles: true,
       cancelable: true,
-      clientX: rect.left + rect.width / 2,
-      clientY: rect.top + rect.height / 2
+      clientX: payload.x,
+      clientY: payload.y
     };
 
     element.dispatchEvent(new MouseEvent('mousedown', eventOptions));
@@ -292,7 +307,7 @@ export class Replayer {
     const payload = event.payload as InputPayload;
     const selector = payload.selector;
     const value = payload.value;
-    let element = await this.findElement(selector) as HTMLInputElement | HTMLTextAreaElement;
+    let element = await this.findElement(selector);
 
     if (!element) {
       console.warn('[ReplayX Replayer] Input target not found:', selector);
@@ -305,22 +320,29 @@ export class Replayer {
     this.moveCursorTo(element);
     await this.delayMs(100);
 
-    if (!this.isElementInteractable(element)) {
-      console.warn('[ReplayX Replayer] Input element not interactable:', selector);
-      return;
-    }
-
     // Focus first
     element.focus();
     await this.delayMs(50);
 
-    // Set value and dispatch standard events to trigger framework state updates
-    if (element.value !== value) {
-      element.value = value;
-      element.dispatchEvent(new Event('input', { bubbles: true }));
-      element.dispatchEvent(new Event('change', { bubbles: true }));
-      // Trigger blur as some apps only save on loss of focus
-      element.dispatchEvent(new Event('blur', { bubbles: true }));
+    if (element instanceof HTMLInputElement && (element.type === 'checkbox' || element.type === 'radio')) {
+      const isChecked = value === 'true';
+      if (element.checked !== isChecked) {
+        this.setNativeProps(element, 'checked', isChecked);
+      }
+    } 
+    // Handle contenteditable
+    else if (element.hasAttribute('contenteditable')) {
+      if (element.innerText !== value) {
+        element.innerText = value;
+        element.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    }
+    // Standard inputs
+    else if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) {
+      if (element.value !== value) {
+        element.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: value }));
+        this.setNativeProps(element, 'value', value);
+      }
     }
   }
 
@@ -339,6 +361,8 @@ export class Replayer {
     } else {
       (element as HTMLElement).scrollTop = scrollTop;
       (element as HTMLElement).scrollLeft = scrollLeft;
+      // Manually trigger scroll event as direct property mutation doesn't always fire it
+      element.dispatchEvent(new Event('scroll', { bubbles: true }));
     }
   }
 
@@ -395,13 +419,13 @@ export class Replayer {
     
     while (performance.now() - startTime < timeoutMs) {
       try {
-        let element = document.querySelector(selector) as HTMLElement;
+        let element = this.querySelectorDeep(selector);
         if (!element) {
           element = this.tryAlternativeSelectors(selector);
         }
         
-        // Ensure element exists and is visible before returning
-        if (element && this.isElementInteractable(element)) {
+        // Ensure element exists and is interactable (or a functional hidden input/form element)
+        if (element && (this.isElementInteractable(element) || element.matches('input, textarea, select'))) {
           return element;
         }
       } catch (e) {}
@@ -413,6 +437,44 @@ export class Replayer {
     return null;
   }
 
+  /**
+   * Shadow-piercing query selector
+   */
+  private querySelectorDeep(selector: string, root: Document | Element | ShadowRoot = document): HTMLElement | null {
+    if (root instanceof Element && root.matches(selector)) return root as HTMLElement;
+
+    const el = (root as Document | Element | ShadowRoot).querySelector(selector) as HTMLElement;
+    if (el) return el;
+
+    const elements = (root as Document).querySelectorAll('*');
+    for (let i = 0; i < elements.length; i++) {
+      const shadowRoot = elements[i].shadowRoot;
+      if (shadowRoot) {
+        const found = this.querySelectorDeep(selector, shadowRoot);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Programmatically set property bypassing framework (React/Vue) setter overrides
+   */
+  private setNativeProps(element: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement, prop: 'value' | 'checked', value: any) {
+    const prototype = Object.getPrototypeOf(element);
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, prop);
+    
+    if (descriptor && descriptor.set) {
+      descriptor.set.call(element, value);
+    } else {
+      (element as any)[prop] = value;
+    }
+
+    // Trigger events to notify framework observers
+    element.dispatchEvent(new Event('input', { bubbles: true }));
+    element.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
   private tryAlternativeSelectors(originalSelector: string): HTMLElement | null {
     // Try data attributes
     const dataAttrs = ['data-testid', 'data-cy', 'data-test'];
@@ -420,7 +482,8 @@ export class Replayer {
       if (originalSelector.includes(`[${attr}`)) {
         const value = originalSelector.match(new RegExp(`\\[${attr}="([^"]+)"\\]`))?.[1];
         if (value) {
-          const element = document.querySelector(`[${attr}="${value}"]`) as HTMLElement;
+          // Fix 3: Use querySelectorDeep for alternative selectors to support Shadow DOM
+          const element = this.querySelectorDeep(`[${attr}="${value}"]`);
           if (element) return element;
         }
       }
@@ -429,14 +492,14 @@ export class Replayer {
     // Try ID
     const idMatch = originalSelector.match(/#([^ >]+)/);
     if (idMatch) {
-      const element = document.getElementById(idMatch[1]);
+      const element = this.querySelectorDeep(`#${idMatch[1]}`);
       if (element) return element;
     }
 
     // Try simplified selector
     const parts = originalSelector.split(' > ');
     const lastPart = parts[parts.length - 1].split(':')[0];
-    const element = document.querySelector(lastPart) as HTMLElement;
+    const element = this.querySelectorDeep(lastPart);
     if (element) return element;
 
     return null;
@@ -494,7 +557,7 @@ export class Replayer {
       border: '2px solid #ff0000',
       zIndex: '9999999',
       pointerEvents: 'none',
-      transition: 'all 0.2s ease-out',
+      transition: `all ${0.2 / this.state.speed}s ease-out`,
       boxShadow: '0 0 10px rgba(255, 0, 0, 0.5)'
     });
 

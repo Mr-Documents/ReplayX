@@ -24,6 +24,7 @@ export interface ClickEvent extends BaseEvent {
     x: number;
     y: number;
     targetTag: string;
+    frameUrl?: string;
   };
 }
 
@@ -33,6 +34,7 @@ export interface InputEvent extends BaseEvent {
     selector: string;
     value: string;
     inputType: string;
+    frameUrl?: string;
   };
 }
 
@@ -42,6 +44,7 @@ export interface ScrollEvent extends BaseEvent {
     selector: string;
     scrollTop: number;
     scrollLeft: number;
+    frameUrl?: string;
   };
 }
 
@@ -56,6 +59,7 @@ export interface MutationEvent extends BaseEvent {
     attributeValue?: string;
     oldValue?: string;
     newValue?: string;
+    frameUrl?: string;
   };
 }
 
@@ -64,6 +68,7 @@ export interface NavigationEvent extends BaseEvent {
   payload: {
     url: string;
     referrer?: string;
+    frameUrl?: string;
   };
 }
 
@@ -77,6 +82,7 @@ export interface NetworkEvent extends BaseEvent {
     responseStatus: number;
     responseHeaders: Record<string, string>;
     responseBody: string;
+    frameUrl?: string;
   };
 }
 
@@ -85,6 +91,7 @@ export interface ResizeEvent extends BaseEvent {
   payload: {
     width: number;
     height: number;
+    frameUrl?: string;
   };
 }
 
@@ -92,6 +99,7 @@ export interface FocusEvent extends BaseEvent {
   type: 'Focus';
   payload: {
     selector: string;
+    frameUrl?: string;
   };
 }
 
@@ -99,6 +107,7 @@ export interface BlurEvent extends BaseEvent {
   type: 'Blur';
   payload: {
     selector: string;
+    frameUrl?: string;
   };
 }
 

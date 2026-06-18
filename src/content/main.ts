@@ -71,6 +71,20 @@ function updateWidgetState(isRecording: boolean, isReplaying: boolean = false) {
   }
 }
 
+// Inject immediately at document_start (via manifest) to catch early API calls
+injectInterceptor();
+
+/**
+ * Injects the interceptor into the Main World.
+ * Content scripts in Isolated Worlds cannot patch window.fetch.
+ */
+function injectInterceptor() {
+  const script = document.createElement('script');
+  script.src = chrome.runtime.getURL('dist/content/interceptor.js');
+  script.onload = () => script.remove();
+  (document.head || document.documentElement).appendChild(script);
+}
+
 // Check initial state from background in case of page refresh or navigation
 chrome.runtime.sendMessage({ action: 'GET_STATE' }, (state: any) => {
   if (chrome.runtime.lastError) {
@@ -96,6 +110,7 @@ chrome.runtime.sendMessage({ action: 'GET_STATE' }, (state: any) => {
 
 // Message handlers
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Return true to keep message channel open for async responses
   switch (message.action) {
     case 'START_RECORD':
       try {
@@ -202,6 +217,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     default:
       sendResponse({ success: false, error: 'Unknown action' });
   }
+  return true;
 });
 
 /**
