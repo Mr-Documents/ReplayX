@@ -8,6 +8,7 @@
   let mode: 'IDLE' | 'RECORD' | 'REPLAY' = 'IDLE';
   let replayNetworkEvents: any[] = [];
   let replayIndex = 0;
+  const consumedEventIds = new Set<string>();
 
   window.addEventListener('message', (event) => {
     if (event.data && event.data.source === 'replayx-content') {
@@ -16,6 +17,7 @@
         if (mode === 'REPLAY' && event.data.networkEvents) {
           replayNetworkEvents = event.data.networkEvents;
           replayIndex = 0;
+          consumedEventIds.clear();
           console.log('[ReplayX Interceptor] Loaded', replayNetworkEvents.length, 'network events for replay');
         }
       }

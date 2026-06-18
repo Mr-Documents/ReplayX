@@ -117,6 +117,10 @@ export class Recorder {
   }
 
   public addEvent(event: RecordedEvent) {
+    // Prevent feedback loop: don't record events triggered by our own replayer
+    if ((window as any)._replayx_is_replaying) {
+      return;
+    }
     if (this.isRecording && !this.isPaused) {
       this.events.push(event);
     }
@@ -198,7 +202,7 @@ export class Recorder {
       type: 'Input',
       payload: {
         selector,
-        value,
+        value: maskedValue,
         inputType: (e as any).inputType || 'unknown'
       }
     });
