@@ -10,9 +10,21 @@ let isPaused = false;
 
 // Replay state
 let activeReplaySession: SessionData | null = null;
+let activeReplaySessionId: string | null = null;
 let replayTabId: number | null = null;
 let replaySpeed = 1;
 let isReplayPaused = false;
+let replayProgressIndex = 0;
+
+const REPLAY_STATE_KEY = 'replayx_replay_state';
+
+interface PersistedReplayState {
+  sessionId: string;
+  tabId: number;
+  speed: number;
+  isReplayPaused: boolean;
+  eventIndex: number;
+}
 
 // Session lifecycle management
 const sessionStates = new Map<string, {
@@ -33,6 +45,46 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   cleanupTabState(tabId);
 });
 
+function persistReplayState() {
+  if (!activeReplaySessionId || replayTabId === null) return;
+
+  const state: PersistedReplayState = {
+    sessionId: activeReplaySessionId,
+    tabId: replayTabId,
+    speed: replaySpeed,
+    isReplayPaused,
+    eventIndex: replayProgressIndex
+  };
+
+  chrome.storage.local.set({ [REPLAY_STATE_KEY]: state }, () => {
+    if (chrome.runtime.lastError) {
+      console.warn('[ReplayX BG] Failed to persist replay state:', chrome.runtime.lastError.message);
+    }
+  });
+}
+
+function clearPersistedReplayState() {
+  activeReplaySessionId = null;
+  replayProgressIndex = 0;
+  chrome.storage.local.remove([REPLAY_STATE_KEY], () => {
+    if (chrome.runtime.lastError) {
+      console.warn('[ReplayX BG] Failed to clear replay state:', chrome.runtime.lastError.message);
+    }
+  });
+}
+
+chrome.storage.local.get([REPLAY_STATE_KEY], (result) => {
+  const state = result[REPLAY_STATE_KEY] as PersistedReplayState | undefined;
+  if (state) {
+    activeReplaySessionId = state.sessionId;
+    replayTabId = state.tabId;
+    replaySpeed = state.speed || 1;
+    isReplayPaused = state.isReplayPaused || false;
+    replayProgressIndex = state.eventIndex || 0;
+    console.log('[ReplayX BG] Restored persisted replay state for session:', state.sessionId);
+  }
+});
+
 // Message handling
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const tabId = sender.tab?.id;
@@ -43,19 +95,45 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // If called from content script, return tab-specific state
       const isFromPopup = !tabId;
       const isCurrentTabRecording = tabId !== undefined && tabId === currentTabId;
+      const isCurrentReplayTab = tabId !== undefined && tabId === replayTabId;
 
-      sendResponse({
-        isRecording: isFromPopup ? isRecording : (isCurrentTabRecording ? isRecording : false),
-        currentSessionId: isFromPopup ? currentSessionId : (isCurrentTabRecording ? currentSessionId : null),
-        recordingStartTime: isFromPopup ? recordingStartTime : (isCurrentTabRecording ? recordingStartTime : null),
-        currentTabId: isFromPopup ? currentTabId : (isCurrentTabRecording ? currentTabId : null),
-        isPaused: isFromPopup ? isPaused : (isCurrentTabRecording ? isPaused : false),
-        isReplayPaused: isFromPopup ? isReplayPaused : (replayTabId === tabId ? isReplayPaused : false),
-        activeReplaySession: isFromPopup ? activeReplaySession : (replayTabId === tabId ? activeReplaySession : null),
-        replaySpeed
-      });
+      const respond = (session: SessionData | null) => {
+        sendResponse({
+          isRecording: isFromPopup ? isRecording : (isCurrentTabRecording ? isRecording : false),
+          currentSessionId: isFromPopup ? currentSessionId : (isCurrentTabRecording ? currentSessionId : null),
+          recordingStartTime: isFromPopup ? recordingStartTime : (isCurrentTabRecording ? recordingStartTime : null),
+          currentTabId: isFromPopup ? currentTabId : (isCurrentTabRecording ? currentTabId : null),
+          isPaused: isFromPopup ? isPaused : (isCurrentTabRecording ? isPaused : false),
+          isReplayPaused: isFromPopup ? isReplayPaused : (isCurrentReplayTab ? isReplayPaused : false),
+          activeReplaySession: isFromPopup ? activeReplaySession : (isCurrentReplayTab ? session : null),
+          replaySpeed,
+          replayProgressIndex: isCurrentReplayTab ? replayProgressIndex : 0
+        });
+      };
+
+      if (!activeReplaySession && activeReplaySessionId) {
+        getSession(activeReplaySessionId).then((session) => {
+          activeReplaySession = session;
+          respond(session);
+        }).catch((error) => {
+          console.warn('[ReplayX BG] Failed to restore active replay session:', error);
+          respond(null);
+        });
+        return true;
+      }
+
+      respond(activeReplaySession);
       break;
     }
+    case 'UPDATE_REPLAY_PROGRESS':
+      if (message.sessionId === activeReplaySessionId) {
+        replayProgressIndex = Number(message.progressIndex) || 0;
+        persistReplayState();
+        sendResponse({ success: true });
+      } else {
+        sendResponse({ success: false, error: 'Replay state mismatch' });
+      }
+      break;
 
     case 'SAVE_RECORDING_EVENTS':
       handleSaveRecordingEvents(message.sessionId, message.events, sendResponse);
@@ -148,8 +226,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'REPLAY_FINISHED':
       console.log('[ReplayX BG] Replay finished');
       activeReplaySession = null;
+      activeReplaySessionId = null;
       replayTabId = null;
       isReplayPaused = false;
+      clearPersistedReplayState();
       sendResponse({ success: true });
       break;
 
@@ -360,9 +440,12 @@ async function handleReplaySession(sessionId: string, speed: number, sendRespons
     }
 
     activeReplaySession = session;
+    activeReplaySessionId = session.id;
     replayTabId = tab.id;
     replaySpeed = speed;
     isReplayPaused = false;
+    replayProgressIndex = 0;
+    persistReplayState();
 
     // Check if we need to navigate
     const currentUrl = new URL(tab.url);
@@ -412,13 +495,17 @@ function handleStopReplay(sendResponse: (response: any) => void) {
         console.log('[ReplayX BG] Stop signal sent to inactive tab, clearing state.');
       }
       activeReplaySession = null;
+      activeReplaySessionId = null;
       replayTabId = null;
       isReplayPaused = false;
+      clearPersistedReplayState();
       sendResponse({ success: true });
     });
   } else {
     activeReplaySession = null;
+    activeReplaySessionId = null;
     isReplayPaused = false;
+    clearPersistedReplayState();
     sendResponse({ success: true });
   }
 }
@@ -482,7 +569,9 @@ function cleanupTabState(tabId: number) {
   }
   if (replayTabId === tabId) {
     activeReplaySession = null;
+    activeReplaySessionId = null;
     replayTabId = null;
+    clearPersistedReplayState();
   }
 
   // Clean up session states

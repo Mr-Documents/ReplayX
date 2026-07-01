@@ -33,25 +33,28 @@ export class Replayer {
 
   private boundUnloadHandler = () => this.stop(false);
 
-  async start(session: SessionData & { initialState?: any }, options: { speed?: number } = {}) {
+  async start(session: SessionData & { initialState?: any }, options: { speed?: number; isResume?: boolean; resumeIndex?: number } = {}) {
     if (this.isReplaying) return;
     this.isReplaying = true;
     this.session = session;
     this.state.speed = options.speed || 1;
     this.replayStartTime = performance.now();
     this.replayErrors = [];
-    
+
     // Set global flag to prevent recorder from capturing replayed events
     (window as any)._replayx_is_replaying = true;
 
-    // Check if we are starting from scratch or resuming after a navigation
-    const isResuming = sessionStorage.getItem('replayx_active') === 'true';
+    const isResuming = options.isResume || sessionStorage.getItem('replayx_active') === 'true';
+    const currentUrl = this.normalizeUrl(window.location.href);
+    const sessionStartUrl = this.normalizeUrl(session.url);
+    const isSessionStartPage = currentUrl === sessionStartUrl;
+
     if (!isResuming) {
       sessionStorage.setItem('replayx_event_index', '0');
     }
 
-    // MVP Improvement: Restore Initial State only on the first page of the session
-    if (session.initialState && !isResuming) {
+    // Restore initial state only when we are replaying from the first recorded page.
+    if (session.initialState && !isResuming && isSessionStartPage) {
       console.log('[ReplayX Replayer] Initial state found. Clearing and restoring storage...');
       
       // Clear current state to ensure determinism
@@ -77,6 +80,10 @@ export class Replayer {
       return;
     }
 
+    if (!sessionStorage.getItem('replayx_active')) {
+      sessionStorage.setItem('replayx_active', 'true');
+    }
+
     console.log('[ReplayX Replayer] Starting deterministic replay for session:', session.id);
 
     // Configure network interceptor
@@ -91,7 +98,7 @@ export class Replayer {
     }, '*');
 
     this.createCursor();
-    this.scheduleEvents(session.events);
+    this.scheduleEvents(session.events, options.resumeIndex);
     window.addEventListener('beforeunload', this.boundUnloadHandler);
 
     // Start replay loop
@@ -165,10 +172,18 @@ export class Replayer {
     }
   }
 
-  private scheduleEvents(events: RecordedEvent[]) {
+  private scheduleEvents(events: RecordedEvent[], resumeIndex?: number) {
     // Use index-based tracking to handle multiple visits to the same URL correctly
     const savedIndex = sessionStorage.getItem('replayx_event_index');
-    this.startIndex = savedIndex ? parseInt(savedIndex, 10) : 0;
+    if (savedIndex !== null) {
+      this.startIndex = parseInt(savedIndex, 10);
+    } else if (resumeIndex !== undefined) {
+      this.startIndex = resumeIndex;
+      console.log('[ReplayX Replayer] Resuming from persisted background index', this.startIndex, 'for', window.location.href);
+    } else {
+      this.startIndex = this.findResumeIndex(events);
+      console.log('[ReplayX Replayer] Resuming from event index', this.startIndex, 'for', window.location.href);
+    }
 
     const eventsToSchedule = events.slice(this.startIndex);
     const offset = eventsToSchedule.length > 0 ? eventsToSchedule[0].timestamp : 0;
@@ -182,6 +197,34 @@ export class Replayer {
 
     this.nextEventIndex = 0;
     console.log(`[ReplayX Replayer] Scheduled ${this.eventQueue.length} events (offset ${offset}ms)`);
+  }
+
+  private findResumeIndex(events: RecordedEvent[]): number {
+    const currentUrl = this.normalizeUrl(window.location.href);
+    for (let i = 0; i < events.length; i++) {
+      const frameUrl = this.normalizeUrl(events[i].payload.frameUrl || '');
+      if (frameUrl && frameUrl === currentUrl) {
+        return i;
+      }
+    }
+    return 0;
+  }
+
+  private normalizeUrl(url: string): string {
+    return url.split('#')[0].replace(/\/$/, '').toLowerCase();
+  }
+
+  private persistReplayProgress(progressIndex: number) {
+    if (!this.session || !chrome.runtime?.id) return;
+    chrome.runtime.sendMessage({
+      action: 'UPDATE_REPLAY_PROGRESS',
+      sessionId: this.session.id,
+      progressIndex
+    }, () => {
+      if (chrome.runtime.lastError) {
+        console.warn('[ReplayX Replayer] Could not persist replay progress:', chrome.runtime.lastError.message);
+      }
+    });
   }
 
   private async replayLoop() {
@@ -215,8 +258,10 @@ export class Replayer {
           item.executed = true;
           this.nextEventIndex += 1;
           
-          // Persist progress across reloads
-          sessionStorage.setItem('replayx_event_index', (this.startIndex + this.nextEventIndex).toString());
+          // Persist progress across reloads and navigation.
+          const progressIndex = this.startIndex + this.nextEventIndex;
+          sessionStorage.setItem('replayx_event_index', progressIndex.toString());
+          this.persistReplayProgress(progressIndex);
 
           if (navigationTriggered) {
             this.stop(false); // Stop local loop but keep background session active

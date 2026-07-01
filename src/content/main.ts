@@ -100,8 +100,8 @@ chrome.runtime.sendMessage({ action: 'GET_STATE' }, (state: any) => {
     if (state.isPaused) recorder.pause();
     updateWidgetState(true);
   } else if (state?.activeReplaySession && !replayer.isActive()) {
-    console.log('[ReplayX] Automatically starting replay after navigation');
-    startReplaySession(state.activeReplaySession, state.replaySpeed);
+    console.log('[ReplayX] Automatically resuming replay after navigation');
+    startReplaySession(state.activeReplaySession, state.replaySpeed, true, state.replayProgressIndex || 0);
     if (state.isReplayPaused) replayer.pause();
   } else {
     updateWidgetState(false);
@@ -223,9 +223,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 /**
  * Shared helper to start replay and update UI
  */
-function startReplaySession(session: SessionData, speed: number) {
+function startReplaySession(session: SessionData, speed: number, isResume: boolean = false, resumeIndex: number = 0) {
   updateWidgetState(false, true);
-  replayer.start(session, { speed: speed || 1 });
+  replayer.start(session, { speed: speed || 1, isResume, resumeIndex });
 }
 
 // Handle network events from interceptor
