@@ -138,14 +138,28 @@ export class Replayer {
     // Signal completion to the background script so it can clear the active session state.
     // This must be sent whenever replaying stops to ensure the background script 
     // doesn't stay in a "replaying" state.
-    if (isFinished && chrome.runtime?.id) {
-      chrome.runtime.sendMessage({
-        action: 'REPLAY_FINISHED',
-        errors: this.replayErrors
-      });
-      sessionStorage.removeItem('replayx_active');
-      sessionStorage.removeItem('replayx_event_index');
-    } else if (!isFinished) {
+    if (isFinished) {
+      // Clear client-side state immediately so UI reflects completion quickly
+      try {
+        sessionStorage.removeItem('replayx_active');
+        sessionStorage.removeItem('replayx_event_index');
+      } catch (e) {
+        console.warn('[ReplayX Replayer] Failed to clear sessionStorage on finish', e);
+      }
+
+      // Notify background and log the result. Use callback to surface errors.
+      if (chrome?.runtime?.sendMessage) {
+        chrome.runtime.sendMessage({ action: 'REPLAY_FINISHED', errors: this.replayErrors }, (resp) => {
+          if (chrome.runtime.lastError) {
+            console.warn('[ReplayX Replayer] REPLAY_FINISHED message failed:', chrome.runtime.lastError.message);
+          } else {
+            console.log('[ReplayX Replayer] Background acknowledged REPLAY_FINISHED', resp);
+          }
+        });
+      } else {
+        console.log('[ReplayX Replayer] No chrome.runtime available to send REPLAY_FINISHED');
+      }
+    } else {
       // Don't remove replayx_active if we are just navigating
     }
 
