@@ -1,10 +1,12 @@
 export type EventType =
   | 'Click'
+  | 'DoubleClick'
   | 'Input'
   | 'Scroll'
   | 'Mutation'
   | 'Navigation'
   | 'Network'
+  | 'Key'
   | 'Resize'
   | 'Focus'
   | 'Blur';
@@ -12,6 +14,7 @@ export type EventType =
 export interface BaseEvent {
   id: string; // Unique event ID
   sessionId: string; // Session this event belongs to
+  sequence?: number; // Monotonic sequence number within session
   type: EventType;
   timestamp: number; // Normalized timestamp (ms since session start)
   payload: Record<string, any>; // Event-specific data
@@ -24,8 +27,15 @@ export interface ClickEvent extends BaseEvent {
     x: number;
     y: number;
     targetTag: string;
+    textSnippet?: string;
+    dbl?: boolean;
     frameUrl?: string;
   };
+}
+
+export interface DoubleClickEvent extends BaseEvent {
+  type: 'DoubleClick';
+  payload: ClickEvent['payload'];
 }
 
 export interface InputEvent extends BaseEvent {
@@ -34,6 +44,20 @@ export interface InputEvent extends BaseEvent {
     selector: string;
     value: string;
     inputType: string;
+    textSnippet?: string;
+    frameUrl?: string;
+  };
+}
+
+export interface KeyEvent extends BaseEvent {
+  type: 'Key';
+  payload: {
+    key: string;
+    code?: string;
+    altKey?: boolean;
+    ctrlKey?: boolean;
+    metaKey?: boolean;
+    shiftKey?: boolean;
     frameUrl?: string;
   };
 }
@@ -113,11 +137,13 @@ export interface BlurEvent extends BaseEvent {
 
 export type RecordedEvent =
   | ClickEvent
+  | DoubleClickEvent
   | InputEvent
   | ScrollEvent
   | MutationEvent
   | NavigationEvent
   | NetworkEvent
+  | KeyEvent
   | ResizeEvent
   | FocusEvent
   | BlurEvent;

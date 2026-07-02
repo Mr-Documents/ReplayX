@@ -166,7 +166,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case 'START_REPLAY':
       try {
-        startReplaySession(message.session, message.speed);
+        // allow resumeIndex when starting replay from a specific event
+        startReplaySession(message.session, message.speed, false, message.resumeIndex || 0);
         sendResponse({ success: true });
       } catch (error) {
         console.error('[ReplayX] Error starting replay:', error);
@@ -218,6 +219,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ success: false, error: 'Unknown action' });
   }
   return true;
+});
+
+// Support stepping the replay from background
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.action === 'STEP_REPLAY') {
+    try {
+      replayer.step();
+      sendResponse({ success: true });
+    } catch (e) {
+      sendResponse({ success: false, error: e instanceof Error ? e.message : String(e) });
+    }
+    return true;
+  }
 });
 
 /**

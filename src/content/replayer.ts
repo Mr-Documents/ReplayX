@@ -20,6 +20,7 @@ export class Replayer {
   private replayStartTime: number = 0;
   private session: SessionData | null = null;
   private startIndex: number = 0;
+  private pendingMockCount: number = 0;
 
   public onStop?: () => void;
 
@@ -97,6 +98,12 @@ export class Replayer {
       }))
     }, '*');
 
+    // Track how many network mocks are available to be consumed
+    this.pendingMockCount = session.events.filter(e => e.type === 'Network').length;
+
+    // Listen for interceptor messages about mocks being consumed
+    window.addEventListener('message', this.boundInterceptorMessage);
+
     this.createCursor();
     this.scheduleEvents(session.events, options.resumeIndex);
     window.addEventListener('beforeunload', this.boundUnloadHandler);
@@ -107,6 +114,16 @@ export class Replayer {
 
     // Set up replay controls
     this.setupKeyboardControls();
+  }
+
+  private boundInterceptorMessage = (ev: MessageEvent) => {
+    try {
+      if (!ev.data || ev.data.source !== 'replayx-interceptor') return;
+      if (ev.data.action === 'MOCK_CONSUMED') {
+        // A mock was consumed; decrement pending count if present
+        this.pendingMockCount = Math.max(0, this.pendingMockCount - 1);
+      }
+    } catch (e) {}
   }
 
   public isActive(): boolean {
@@ -134,6 +151,8 @@ export class Replayer {
       action: 'SET_MODE',
       mode: 'IDLE'
     }, '*');
+
+    window.removeEventListener('message', this.boundInterceptorMessage);
 
     // Signal completion to the background script so it can clear the active session state.
     // This must be sent whenever replaying stops to ensure the background script 
@@ -165,6 +184,38 @@ export class Replayer {
 
     if (this.onStop) this.onStop();
     console.log('[ReplayX Replayer] Replay stopped');
+  }
+
+  public async step() {
+    if (!this.isReplaying) return;
+    // execute a single event regardless of timing
+    if (this.nextEventIndex >= this.eventQueue.length) return;
+
+    const item = this.eventQueue[this.nextEventIndex];
+    try {
+      const navigationTriggered = await this.executeEvent(item.event);
+      item.executed = true;
+      this.nextEventIndex += 1;
+
+      const progressIndex = this.startIndex + this.nextEventIndex;
+      sessionStorage.setItem('replayx_event_index', progressIndex.toString());
+      this.persistReplayProgress(progressIndex);
+
+      // Process async queues after the single step
+      await this.processAsyncQueues();
+
+      // Pause after stepping
+      this.pause();
+
+      if (navigationTriggered) {
+        this.stop(false);
+        return;
+      }
+    } catch (error) {
+      console.error('[ReplayX Replayer] Step execution failed:', item.event, error);
+      this.replayErrors.push({ event: item.event, error: String(error) });
+      this.nextEventIndex += 1;
+    }
   }
 
   pause() {
@@ -307,6 +358,10 @@ export class Replayer {
     switch (event.type) {
       case 'Click':
         return await this.executeClick(event);
+      case 'DoubleClick':
+        return await this.executeClick(event);
+      case 'Key':
+        return await this.executeKey(event);
       case 'Input':
         return await this.executeInput(event);
       case 'Scroll':
@@ -330,10 +385,14 @@ export class Replayer {
     if (event.type !== 'Click') return;
     const payload = event.payload as ClickPayload;
     const selector = payload.selector;
-    let element = await this.findElement(selector);
+    let element = await this.findElement({ selector, textSnippet: (payload as any).textSnippet });
 
     if (!element) {
+      const dom = document.body ? document.body.innerHTML.slice(0, 5000) : '';
       console.warn('[ReplayX Replayer] Click target not found:', selector);
+      this.replayErrors.push({ event, error: 'target not found', });
+      // include snapshot as a best-effort property
+      try { (this.replayErrors[this.replayErrors.length-1] as any).dom = dom; } catch (e) {}
       return;
     }
 
@@ -359,6 +418,12 @@ export class Replayer {
     
     // Use native click() as it triggers both the event and the default browser action
     element.click();
+    if ((payload as any).dbl) {
+      element.dispatchEvent(new MouseEvent('dblclick', eventOptions));
+    }
+
+    // Wait for network or DOM settle heuristics
+    await this.waitForNetworkIdle(1500);
   }
 
   private async executeInput(event: RecordedEvent) {
@@ -366,10 +431,13 @@ export class Replayer {
     const payload = event.payload as InputPayload;
     const selector = payload.selector;
     const value = payload.value;
-    let element = await this.findElement(selector);
+    let element = await this.findElement({ selector, textSnippet: (payload as any).textSnippet });
 
     if (!element) {
+      const dom = document.body ? document.body.innerHTML.slice(0, 5000) : '';
       console.warn('[ReplayX Replayer] Input target not found:', selector);
+      this.replayErrors.push({ event, error: 'input target not found' });
+      try { (this.replayErrors[this.replayErrors.length-1] as any).dom = dom; } catch (e) {}
       return;
     }
 
@@ -403,6 +471,35 @@ export class Replayer {
         this.setNativeProps(element, 'value', value);
       }
     }
+  }
+
+  private async executeKey(event: RecordedEvent) {
+    if (event.type !== 'Key') return;
+    const payload = event.payload as any;
+    const active = document.activeElement as HTMLElement | null;
+    if (!active) return;
+
+    const evDown = new KeyboardEvent('keydown', {
+      key: payload.key,
+      code: payload.code,
+      altKey: !!payload.altKey,
+      ctrlKey: !!payload.ctrlKey,
+      metaKey: !!payload.metaKey,
+      shiftKey: !!payload.shiftKey,
+      bubbles: true
+    });
+    active.dispatchEvent(evDown);
+
+    const evUp = new KeyboardEvent('keyup', {
+      key: payload.key,
+      code: payload.code,
+      altKey: !!payload.altKey,
+      ctrlKey: !!payload.ctrlKey,
+      metaKey: !!payload.metaKey,
+      shiftKey: !!payload.shiftKey,
+      bubbles: true
+    });
+    active.dispatchEvent(evUp);
   }
 
   private async executeScroll(event: RecordedEvent) {
@@ -442,10 +539,23 @@ export class Replayer {
     const normalize = (u: string) => u.replace(/\/$/, '').toLowerCase();
     if (normalize(window.location.href) !== normalize(url)) {
       console.log('[ReplayX Replayer] Redirecting to next page:', url);
+      // Navigate and wait for page load; let background/state handle resuming
       window.location.href = url;
       return true;
     }
     return false;
+  }
+
+  private waitForNetworkIdle(timeoutMs: number = 2000): Promise<void> {
+    const start = performance.now();
+    return new Promise((resolve) => {
+      const check = () => {
+        if (this.pendingMockCount <= 0) return resolve();
+        if (performance.now() - start > timeoutMs) return resolve();
+        setTimeout(check, 50);
+      };
+      check();
+    });
   }
 
   private async executeResize(event: RecordedEvent) {
@@ -473,14 +583,16 @@ export class Replayer {
     }
   }
 
-  private async findElement(selector: string, timeoutMs: number = 3000): Promise<HTMLElement | null> {
+  private async findElement(selectorOrObj: any, timeoutMs: number = 3000): Promise<HTMLElement | null> {
+    const selector = typeof selectorOrObj === 'string' ? selectorOrObj : selectorOrObj?.selector;
+    const textSnippet = typeof selectorOrObj === 'object' ? selectorOrObj?.textSnippet : undefined;
     const startTime = performance.now();
     
     while (performance.now() - startTime < timeoutMs) {
       try {
         let element = this.querySelectorDeep(selector);
         if (!element) {
-          element = this.tryAlternativeSelectors(selector);
+          element = this.tryAlternativeSelectors(selector, textSnippet);
         }
         
         // Ensure element exists and is interactable (or a functional hidden input/form element)
@@ -534,7 +646,7 @@ export class Replayer {
     element.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
-  private tryAlternativeSelectors(originalSelector: string): HTMLElement | null {
+  private tryAlternativeSelectors(originalSelector: string, textSnippet?: string): HTMLElement | null {
     // Try data attributes
     const dataAttrs = ['data-testid', 'data-cy', 'data-test'];
     for (const attr of dataAttrs) {
@@ -558,8 +670,21 @@ export class Replayer {
     // Try simplified selector
     const parts = originalSelector.split(' > ');
     const lastPart = parts[parts.length - 1].split(':')[0];
-    const element = this.querySelectorDeep(lastPart);
+    let element = this.querySelectorDeep(lastPart);
     if (element) return element;
+
+    // If we have a text snippet, try matching by tag + text content contains snippet
+    if (textSnippet) {
+      try {
+        const tagMatch = lastPart.match(/^([a-z0-9\-]+)/i);
+        const tag = tagMatch ? tagMatch[1] : null;
+        const candidates = tag ? Array.from(document.querySelectorAll(tag)) : Array.from(document.querySelectorAll('*'));
+        for (const c of candidates) {
+          const el = c as HTMLElement;
+          if (el && (el.textContent || '').includes(textSnippet)) return el;
+        }
+      } catch (e) {}
+    }
 
     return null;
   }

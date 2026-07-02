@@ -14,6 +14,7 @@ import { SessionData } from '../types';
 export class Recorder {
   private events: RecordedEvent[] = [];
   private sessionId: string = '';
+  private sequenceCounter: number = 0;
   private sessionStartTime: number = 0;
   private isRecording = false;
   private isPaused = false;
@@ -23,11 +24,14 @@ export class Recorder {
 
   // Event handlers
   private boundClickHandler = this.onClick.bind(this);
+  private boundDblClickHandler = this.onDblClick.bind(this);
   private boundInputHandler = this.onInput.bind(this);
   private boundScrollHandler = this.onScroll.bind(this);
   private boundResizeHandler = this.onResize.bind(this);
   private boundFocusHandler = this.onFocus.bind(this);
   private boundBlurHandler = this.onBlur.bind(this);
+  private boundKeyDownHandler = this.onKeyDown.bind(this);
+  private boundKeyUpHandler = this.onKeyUp.bind(this);
   private boundNavigationHandler = this.onNavigation.bind(this);
 
   start(sessionId: string, sessionStartTime?: number) {
@@ -49,11 +53,14 @@ export class Recorder {
 
     // Add event listeners
     document.addEventListener('click', this.boundClickHandler, true);
+    document.addEventListener('dblclick', this.boundDblClickHandler, true);
     document.addEventListener('input', this.boundInputHandler, true);
     document.addEventListener('scroll', this.boundScrollHandler, true);
     window.addEventListener('resize', this.boundResizeHandler);
     document.addEventListener('focus', this.boundFocusHandler, true);
     document.addEventListener('blur', this.boundBlurHandler, true);
+    document.addEventListener('keydown', this.boundKeyDownHandler, true);
+    document.addEventListener('keyup', this.boundKeyUpHandler, true);
 
     // Navigation events
     this.setupNavigationTracking();
@@ -76,11 +83,14 @@ export class Recorder {
 
     // Remove event listeners
     document.removeEventListener('click', this.boundClickHandler, true);
+    document.removeEventListener('dblclick', this.boundDblClickHandler, true);
     document.removeEventListener('input', this.boundInputHandler, true);
     document.removeEventListener('scroll', this.boundScrollHandler, true);
     window.removeEventListener('resize', this.boundResizeHandler);
     document.removeEventListener('focus', this.boundFocusHandler, true);
     document.removeEventListener('blur', this.boundBlurHandler, true);
+    document.removeEventListener('keydown', this.boundKeyDownHandler, true);
+    document.removeEventListener('keyup', this.boundKeyUpHandler, true);
     this.cleanupNavigationTracking();
 
     // Disconnect mutation observer
@@ -121,6 +131,9 @@ export class Recorder {
     if ((window as any)._replayx_is_replaying) return;
 
     if (this.isRecording && !this.isPaused) {
+      // assign monotonic sequence number
+      this.sequenceCounter += 1;
+      (event as any).sequence = this.sequenceCounter;
       // Guard 2: Tag the event with the current frame's URL for deterministic replay
       event.payload.frameUrl = window.location.href;
       this.events.push(event);
@@ -164,6 +177,7 @@ export class Recorder {
     const target = e.target as HTMLElement;
     const selector = this.getRobustSelector(target);
     const rect = target.getBoundingClientRect();
+    const textSnippet = (target.textContent || '').trim().slice(0, 120);
 
     this.addEvent({
       id: this.generateId(),
@@ -175,6 +189,28 @@ export class Recorder {
         x: e.clientX,
         y: e.clientY,
         targetTag: target.tagName.toLowerCase()
+        , textSnippet
+      }
+    });
+  }
+
+  private onDblClick(e: MouseEvent) {
+    const target = e.target as HTMLElement;
+    const selector = this.getRobustSelector(target);
+    const textSnippet = (target.textContent || '').trim().slice(0, 120);
+
+    this.addEvent({
+      id: this.generateId(),
+      sessionId: this.sessionId,
+      timestamp: this.getTimestamp(),
+      type: 'Click',
+      payload: {
+        selector,
+        x: e.clientX,
+        y: e.clientY,
+        targetTag: target.tagName.toLowerCase(),
+        textSnippet,
+        dbl: true
       }
     });
   }
@@ -214,6 +250,42 @@ export class Recorder {
         selector,
         value: maskedValue,
         inputType: (e as any).inputType || 'unknown'
+        , textSnippet: (target.textContent || (inputTarget.value || '')).slice(0, 120)
+      }
+    });
+  }
+
+  private onKeyDown(e: KeyboardEvent) {
+    // Don't record modifier repeats as separate if needed, but include all for fidelity
+    this.addEvent({
+      id: this.generateId(),
+      sessionId: this.sessionId,
+      timestamp: this.getTimestamp(),
+      type: 'Key',
+      payload: {
+        key: e.key,
+        code: e.code,
+        altKey: e.altKey,
+        ctrlKey: e.ctrlKey,
+        metaKey: e.metaKey,
+        shiftKey: e.shiftKey
+      }
+    });
+  }
+
+  private onKeyUp(e: KeyboardEvent) {
+    this.addEvent({
+      id: this.generateId(),
+      sessionId: this.sessionId,
+      timestamp: this.getTimestamp(),
+      type: 'Key',
+      payload: {
+        key: e.key,
+        code: e.code,
+        altKey: e.altKey,
+        ctrlKey: e.ctrlKey,
+        metaKey: e.metaKey,
+        shiftKey: e.shiftKey
       }
     });
   }

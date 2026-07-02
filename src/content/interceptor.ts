@@ -42,6 +42,10 @@
       
       if (mockEvent) {
         console.log(`[ReplayX] Mocking fetch: ${method} ${url}`);
+          // Notify page that a mock was consumed so replayer can wait for network-idle
+          try {
+            window.postMessage({ source: 'replayx-interceptor', action: 'MOCK_CONSUMED', id: mockEvent.id }, '*');
+          } catch (e) {}
         return createMockResponse(mockEvent);
       }
       console.warn(`[ReplayX] No mock found for fetch: ${method} ${url}, passing through`);
@@ -64,17 +68,20 @@
         const responseBody = await clonedResponse.text();
 
         // Send network event to content script
+        const safeRequestHeaders = sanitizeHeaders(requestHeaders || {});
+        const safeResponseHeaders = sanitizeHeaders(responseHeaders || {});
+
         window.postMessage({
           source: 'replayx-interceptor',
           type: 'Network',
           timestamp: startTime,
           method,
           url,
-          requestHeaders,
-          requestBody,
+          requestHeaders: safeRequestHeaders,
+          requestBody: sanitizeBody(requestBody),
           responseStatus: response.status,
-          responseHeaders,
-          responseBody
+          responseHeaders: safeResponseHeaders,
+          responseBody: sanitizeBody(responseBody)
         }, '*');
       } catch (error) {
         console.error('[ReplayX] Error recording fetch:', error);
@@ -151,6 +158,9 @@
       
       if (mockEvent) {
         console.log(`[ReplayX] Mocking XHR: ${instance.method} ${instance.url}`);
+        try {
+          window.postMessage({ source: 'replayx-interceptor', action: 'MOCK_CONSUMED', id: mockEvent.id }, '*');
+        } catch (e) {}
         mockXHRResponse(xhr, mockEvent);
         return;
       }
@@ -173,11 +183,11 @@
               timestamp: instance.startTime,
               method: instance.method,
               url: instance.url,
-              requestHeaders: instance.requestHeaders,
-              requestBody: instance.requestBody,
+              requestHeaders: sanitizeHeaders(instance.requestHeaders || {}),
+              requestBody: sanitizeBody(instance.requestBody),
               responseStatus: xhr.status,
-              responseHeaders,
-              responseBody: xhr.responseText || ''
+              responseHeaders: sanitizeHeaders(responseHeaders || {}),
+              responseBody: sanitizeBody(xhr.responseText || '')
             }, '*');
           } catch (error) {
             console.error('[ReplayX] Error recording XHR:', error);
@@ -224,6 +234,41 @@
 
     if (match) consumedEventIds.add(match.id);
     return match;
+  }
+
+  function sanitizeHeaders(headers: Record<string, string>): Record<string, string> {
+    const copy: Record<string, string> = {};
+    for (const k of Object.keys(headers || {})) {
+      const low = k.toLowerCase();
+      if (low === 'authorization' || low === 'cookie' || low === 'set-cookie') continue;
+      copy[k] = headers[k];
+    }
+    return copy;
+  }
+
+  function sanitizeBody(body: any): any {
+    if (!body) return body;
+    try {
+      if (typeof body === 'string' && (body.trim().startsWith('{') || body.trim().startsWith('['))) {
+        const parsed = JSON.parse(body);
+        // Mask common sensitive keys
+        const sensitive = ['password', 'card', 'cc', 'cvv', 'token'];
+        const maskObj = (obj: any) => {
+          if (Array.isArray(obj)) return obj.map(maskObj);
+          if (obj && typeof obj === 'object') {
+            const out: any = {};
+            for (const k of Object.keys(obj)) {
+              if (sensitive.includes(k.toLowerCase())) out[k] = '*****';
+              else out[k] = maskObj(obj[k]);
+            }
+            return out;
+          }
+          return obj;
+        };
+        return JSON.stringify(maskObj(parsed));
+      }
+    } catch (e) {}
+    return body;
   }
 
   function createMockResponse(event: any): Response {

@@ -176,8 +176,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       });
       return true; // async
 
+    case 'GET_SESSION':
+      if (!message.sessionId) {
+        sendResponse({ success: false, error: 'Missing sessionId' });
+        return;
+      }
+      getSession(message.sessionId).then(session => sendResponse({ success: true, session })).catch(error => {
+        console.error('[ReplayX BG] Error getting session:', error);
+        sendResponse({ success: false, error: error.message });
+      });
+      return true;
+
     case 'REPLAY_SESSION':
-      handleReplaySession(message.sessionId, message.speed || 1, sendResponse);
+      handleReplaySession(message.sessionId, message.speed || 1, sendResponse, message.startIndex, message.step);
       return true; // async
 
     case 'STOP_REPLAY':
@@ -204,6 +215,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       replaySpeed = Math.max(0.1, Math.min(10, message.speed || 1));
       if (replayTabId) {
         chrome.tabs.sendMessage(replayTabId, { action: 'SET_REPLAY_SPEED', speed: replaySpeed });
+      }
+      sendResponse({ success: true });
+      break;
+
+    case 'STEP_REPLAY':
+      if (replayTabId) {
+        chrome.tabs.sendMessage(replayTabId, { action: 'STEP_REPLAY' }, (resp) => {
+          if (chrome.runtime.lastError) {
+            console.warn('[ReplayX BG] STEP_REPLAY failed to send:', chrome.runtime.lastError.message);
+          }
+        });
       }
       sendResponse({ success: true });
       break;
@@ -409,7 +431,7 @@ function handleSaveRecordingEvents(sessionId: string, events: RecordedEvent[], s
 }
 
 // Replay handlers
-async function handleReplaySession(sessionId: string, speed: number, sendResponse: (response: any) => void) {
+async function handleReplaySession(sessionId: string, speed: number, sendResponse: (response: any) => void, startIndex?: number, step?: boolean) {
   if (activeReplaySession) {
     // Force stop existing replay before starting a new one
     await new Promise((resolve) => {
@@ -461,7 +483,8 @@ async function handleReplaySession(sessionId: string, speed: number, sendRespons
       let response = await sendMessageToTab(tab.id, {
         action: 'START_REPLAY',
         session,
-        speed
+        speed,
+        resumeIndex: startIndex || 0
       });
 
       if (response?.error && response.error.includes('Receiving end does not exist')) {
@@ -475,6 +498,10 @@ async function handleReplaySession(sessionId: string, speed: number, sendRespons
         replayTabId = null;
         sendResponse({ success: false, error: response.error });
       } else {
+        // If caller requested a single-step start, forward STEP_REPLAY
+        if (step) {
+          chrome.tabs.sendMessage(tab.id, { action: 'STEP_REPLAY' });
+        }
         sendResponse({ success: true });
       }
     }
