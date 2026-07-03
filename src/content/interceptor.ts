@@ -32,6 +32,8 @@
   window.fetch = async function(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
     const method = (init?.method || (input instanceof Request ? input.method : 'GET')).toUpperCase();
+    const requestStartMs = Date.now();
+    const requestStartPerf = performance.now();
 
     if (mode === 'REPLAY') {
       // Match on body as well for deterministic replay of mutations (POST/GraphQL)
@@ -51,8 +53,9 @@
       console.warn(`[ReplayX] No mock found for fetch: ${method} ${url}, passing through`);
     }
 
-    const startTime = performance.now();
+    const startTime = requestStartMs;
     const response = await originalFetch.apply(this, [input, init]);
+    const duration = performance.now() - requestStartPerf;
 
     if (mode === 'RECORD') {
       try {
@@ -75,6 +78,7 @@
           source: 'replayx-interceptor',
           type: 'Network',
           timestamp: startTime,
+          duration,
           method,
           url,
           requestHeaders: safeRequestHeaders,
@@ -181,6 +185,7 @@
               source: 'replayx-interceptor',
               type: 'Network',
               timestamp: instance.startTime,
+              duration: performance.now() - instance.startTime,
               method: instance.method,
               url: instance.url,
               requestHeaders: sanitizeHeaders(instance.requestHeaders || {}),

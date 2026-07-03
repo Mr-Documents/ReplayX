@@ -2,12 +2,19 @@ import {
   RecordedEvent,
   ClickEvent,
   InputEvent,
+  ChangeEvent,
+  FormSubmitEvent,
   ScrollEvent,
   MutationEvent,
   NavigationEvent,
   ResizeEvent,
   FocusEvent,
-  BlurEvent
+  BlurEvent,
+  TargetPayload,
+  ClickPayload,
+  InputPayload,
+  ChangePayload,
+  SubmitPayload
 } from '../types';
 import { SessionData } from '../types';
 
@@ -26,6 +33,8 @@ export class Recorder {
   private boundClickHandler = this.onClick.bind(this);
   private boundDblClickHandler = this.onDblClick.bind(this);
   private boundInputHandler = this.onInput.bind(this);
+  private boundChangeHandler = this.onChange.bind(this);
+  private boundSubmitHandler = this.onSubmit.bind(this);
   private boundScrollHandler = this.onScroll.bind(this);
   private boundResizeHandler = this.onResize.bind(this);
   private boundFocusHandler = this.onFocus.bind(this);
@@ -47,7 +56,8 @@ export class Recorder {
       localStorage: this.captureStorage(localStorage),
       sessionStorage: this.captureStorage(sessionStorage),
       url: window.location.href,
-      viewport: { width: window.innerWidth, height: window.innerHeight }
+      viewport: { width: window.innerWidth, height: window.innerHeight },
+      cookies: document.cookie
     };
     console.log('[ReplayX Recorder] Captured initial state');
 
@@ -55,6 +65,8 @@ export class Recorder {
     document.addEventListener('click', this.boundClickHandler, true);
     document.addEventListener('dblclick', this.boundDblClickHandler, true);
     document.addEventListener('input', this.boundInputHandler, true);
+    document.addEventListener('change', this.boundChangeHandler, true);
+    document.addEventListener('submit', this.boundSubmitHandler, true);
     document.addEventListener('scroll', this.boundScrollHandler, true);
     window.addEventListener('resize', this.boundResizeHandler);
     document.addEventListener('focus', this.boundFocusHandler, true);
@@ -85,6 +97,8 @@ export class Recorder {
     document.removeEventListener('click', this.boundClickHandler, true);
     document.removeEventListener('dblclick', this.boundDblClickHandler, true);
     document.removeEventListener('input', this.boundInputHandler, true);
+    document.removeEventListener('change', this.boundChangeHandler, true);
+    document.removeEventListener('submit', this.boundSubmitHandler, true);
     document.removeEventListener('scroll', this.boundScrollHandler, true);
     window.removeEventListener('resize', this.boundResizeHandler);
     document.removeEventListener('focus', this.boundFocusHandler, true);
@@ -175,9 +189,7 @@ export class Recorder {
 
   private onClick(e: MouseEvent) {
     const target = e.target as HTMLElement;
-    const selector = this.getRobustSelector(target);
-    const rect = target.getBoundingClientRect();
-    const textSnippet = (target.textContent || '').trim().slice(0, 120);
+    const selectorPayload = this.buildTargetPayload(target);
 
     this.addEvent({
       id: this.generateId(),
@@ -185,19 +197,16 @@ export class Recorder {
       timestamp: this.getTimestamp(),
       type: 'Click',
       payload: {
-        selector,
+        ...selectorPayload,
         x: e.clientX,
-        y: e.clientY,
-        targetTag: target.tagName.toLowerCase()
-        , textSnippet
+        y: e.clientY
       }
     });
   }
 
   private onDblClick(e: MouseEvent) {
     const target = e.target as HTMLElement;
-    const selector = this.getRobustSelector(target);
-    const textSnippet = (target.textContent || '').trim().slice(0, 120);
+    const selectorPayload = this.buildTargetPayload(target);
 
     this.addEvent({
       id: this.generateId(),
@@ -205,11 +214,9 @@ export class Recorder {
       timestamp: this.getTimestamp(),
       type: 'Click',
       payload: {
-        selector,
+        ...selectorPayload,
         x: e.clientX,
         y: e.clientY,
-        targetTag: target.tagName.toLowerCase(),
-        textSnippet,
         dbl: true
       }
     });
@@ -217,28 +224,25 @@ export class Recorder {
 
   private onInput(e: Event) {
     const target = e.target as HTMLElement;
-    const selector = this.getRobustSelector(target);
     const inputTarget = target as HTMLInputElement;
-    
+    const selectorPayload = this.buildTargetPayload(target);
+
     // Handle specialized input types
     let value: string;
-    if (inputTarget.type === 'checkbox' || inputTarget.type === 'radio') {
+    if (inputTarget?.type === 'checkbox' || inputTarget?.type === 'radio') {
       value = String(inputTarget.checked);
     } else if (target.hasAttribute('contenteditable')) {
       value = target.innerText;
     } else {
-      value = inputTarget.value || '';
+      value = inputTarget?.value || '';
     }
 
-    // MVP Improvement: Basic Privacy Masking
+    // Basic privacy masking
     let maskedValue = value;
-    // Only mask text-based inputs. Checkboxes and Radios use "true"/"false" as value; 
-    // masking them breaks the replay state.
     const isSensitive = ((target as HTMLInputElement).type === 'password' || 
                         target.getAttribute('name')?.toLowerCase().includes('card') ||
                         target.hasAttribute('data-replay-mask')) &&
                         !['checkbox', 'radio'].includes((target as HTMLInputElement).type);
-    
     if (isSensitive) maskedValue = '********';
 
     this.addEvent({
@@ -247,10 +251,54 @@ export class Recorder {
       timestamp: this.getTimestamp(),
       type: 'Input',
       payload: {
-        selector,
+        ...selectorPayload,
         value: maskedValue,
-        inputType: (e as any).inputType || 'unknown'
-        , textSnippet: (target.textContent || (inputTarget.value || '')).slice(0, 120)
+        inputType: (e as any).inputType || inputTarget?.type || 'unknown'
+      }
+    });
+  }
+
+  private onChange(e: Event) {
+    const target = e.target as HTMLElement;
+    const inputTarget = target as HTMLInputElement;
+    const selectorPayload = this.buildTargetPayload(target);
+
+    let value = '';
+    if (inputTarget?.type === 'checkbox' || inputTarget?.type === 'radio') {
+      value = String(inputTarget.checked);
+    } else if (target.hasAttribute('contenteditable')) {
+      value = target.innerText;
+    } else {
+      value = inputTarget?.value || '';
+    }
+
+    this.addEvent({
+      id: this.generateId(),
+      sessionId: this.sessionId,
+      timestamp: this.getTimestamp(),
+      type: 'Change',
+      payload: {
+        ...selectorPayload,
+        value,
+        inputType: (e.target as HTMLInputElement)?.type || 'unknown'
+      }
+    });
+  }
+
+  private onSubmit(e: Event) {
+    const form = (e.target as HTMLElement).closest('form') as HTMLFormElement | null;
+    if (!form) return;
+    const selectorPayload = this.buildTargetPayload(form);
+
+    this.addEvent({
+      id: this.generateId(),
+      sessionId: this.sessionId,
+      timestamp: this.getTimestamp(),
+      type: 'Submit',
+      payload: {
+        ...selectorPayload,
+        formAction: form.action || undefined,
+        formMethod: form.method || undefined
       }
     });
   }
@@ -328,27 +376,27 @@ export class Recorder {
 
   private onFocus(e: Event) {
     const target = e.target as HTMLElement;
-    const selector = this.getRobustSelector(target);
+    const selectorPayload = this.buildTargetPayload(target);
 
     this.addEvent({
       id: this.generateId(),
       sessionId: this.sessionId,
       timestamp: this.getTimestamp(),
       type: 'Focus',
-      payload: { selector }
+      payload: selectorPayload
     });
   }
 
   private onBlur(e: Event) {
     const target = e.target as HTMLElement;
-    const selector = this.getRobustSelector(target);
+    const selectorPayload = this.buildTargetPayload(target);
 
     this.addEvent({
       id: this.generateId(),
       sessionId: this.sessionId,
       timestamp: this.getTimestamp(),
       type: 'Blur',
-      payload: { selector }
+      payload: selectorPayload
     });
   }
 
@@ -475,22 +523,72 @@ export class Recorder {
     });
   }
 
+  private buildTargetPayload(el: Element): TargetPayload {
+    const selector = this.getRobustSelector(el);
+    const id = (el as HTMLElement).id || undefined;
+    const name = (el as HTMLElement).getAttribute('name') || undefined;
+    const dataTestId = ['data-testid', 'data-cy', 'data-test', 'data-qa']
+      .map(attr => ({ attr, value: el.getAttribute(attr) }))
+      .find(item => item.value)?.value;
+
+    return {
+      selector,
+      fallbackSelectors: this.getFallbackSelectors(el, selector),
+      id,
+      name,
+      dataTestId,
+      targetTag: el.tagName.toLowerCase(),
+      textSnippet: (el.textContent || '').trim().slice(0, 120),
+      frameUrl: window.location.href
+    };
+  }
+
+  private getFallbackSelectors(el: Element, primary: string): string[] {
+    const selectors: string[] = [];
+
+    if ((el as HTMLElement).id) {
+      selectors.push(`#${(el as HTMLElement).id}`);
+    }
+
+    const nameAttr = (el as HTMLElement).getAttribute('name');
+    if (nameAttr) {
+      selectors.push(`${el.tagName.toLowerCase()}[name="${nameAttr}"]`);
+    }
+
+    const dataAttrs = ['data-testid', 'data-cy', 'data-test', 'data-qa'];
+    dataAttrs.forEach(attr => {
+      const value = el.getAttribute(attr);
+      if (value) {
+        selectors.push(`[${attr}="${value}"]`);
+      }
+    });
+
+    const classes = Array.from(el.classList)
+      .filter(cls => cls.length > 2 && !cls.match(/^(hover|active|focus|visited|link|disabled|enabled|checked|selected|valid|invalid|required|optional)$/i));
+    if (classes.length > 0) {
+      selectors.push(`${el.tagName.toLowerCase()}.${classes.slice(0, 3).join('.')}`);
+    }
+
+    if (primary && !selectors.includes(primary)) {
+      selectors.unshift(primary);
+    }
+
+    return selectors.filter(Boolean);
+  }
+
   private getRobustSelector(el: Element): string {
     // Priority: data attributes > ID > stable classes > XPath fallback
 
-    // Data attributes (preferred)
     const dataAttrs = ['data-testid', 'data-cy', 'data-test', 'data-qa'];
     for (const attr of dataAttrs) {
       const value = el.getAttribute(attr);
       if (value) return `[${attr}="${value}"]`;
     }
 
-    // ID
     if ((el as HTMLElement).id) {
       return `#${(el as HTMLElement).id}`;
     }
 
-    // Stable classes (exclude utility classes)
     const classes = Array.from(el.classList).filter(cls =>
       cls.length > 2 &&
       !cls.match(/^(hover|active|focus|visited|link|disabled|enabled|checked|selected|valid|invalid|required|optional)$/i) &&
@@ -502,20 +600,16 @@ export class Recorder {
       return `${el.tagName.toLowerCase()}.${classes.join('.')}`;
     }
 
-    // XPath-style selector as fallback
-    let path = [];
+    const path: string[] = [];
     let current: Element | null = el;
 
     while (current && current !== document.body) {
       let selector = current.tagName.toLowerCase();
-
-      // Add nth-child for uniqueness
       const siblings = Array.from(current.parentElement?.children || []);
       const index = siblings.indexOf(current) + 1;
       if (siblings.length > 1) {
         selector += `:nth-child(${index})`;
       }
-
       path.unshift(selector);
       current = current.parentElement;
     }

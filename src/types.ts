@@ -2,6 +2,8 @@ export type EventType =
   | 'Click'
   | 'DoubleClick'
   | 'Input'
+  | 'Change'
+  | 'Submit'
   | 'Scroll'
   | 'Mutation'
   | 'Navigation'
@@ -20,16 +22,31 @@ export interface BaseEvent {
   payload: Record<string, any>; // Event-specific data
 }
 
+export interface InitialStateSnapshot {
+  url: string;
+  viewport: { width: number; height: number };
+  localStorage: Record<string, string>;
+  sessionStorage: Record<string, string>;
+  cookies?: string;
+}
+
+export interface TargetPayload {
+  selector: string;
+  fallbackSelectors?: string[];
+  id?: string;
+  name?: string;
+  dataTestId?: string;
+  targetTag?: string;
+  textSnippet?: string;
+  frameUrl?: string;
+}
+
 export interface ClickEvent extends BaseEvent {
   type: 'Click';
-  payload: {
-    selector: string;
+  payload: TargetPayload & {
     x: number;
     y: number;
-    targetTag: string;
-    textSnippet?: string;
     dbl?: boolean;
-    frameUrl?: string;
   };
 }
 
@@ -40,12 +57,25 @@ export interface DoubleClickEvent extends BaseEvent {
 
 export interface InputEvent extends BaseEvent {
   type: 'Input';
-  payload: {
-    selector: string;
+  payload: TargetPayload & {
     value: string;
     inputType: string;
-    textSnippet?: string;
-    frameUrl?: string;
+  };
+}
+
+export interface ChangeEvent extends BaseEvent {
+  type: 'Change';
+  payload: TargetPayload & {
+    value: string;
+    inputType: string;
+  };
+}
+
+export interface FormSubmitEvent extends BaseEvent {
+  type: 'Submit';
+  payload: TargetPayload & {
+    formAction?: string;
+    formMethod?: string;
   };
 }
 
@@ -64,12 +94,20 @@ export interface KeyEvent extends BaseEvent {
 
 export interface ScrollEvent extends BaseEvent {
   type: 'Scroll';
-  payload: {
-    selector: string;
+  payload: TargetPayload & {
     scrollTop: number;
     scrollLeft: number;
-    frameUrl?: string;
   };
+}
+
+export interface FocusEvent extends BaseEvent {
+  type: 'Focus';
+  payload: TargetPayload;
+}
+
+export interface BlurEvent extends BaseEvent {
+  type: 'Blur';
+  payload: TargetPayload;
 }
 
 export interface MutationEvent extends BaseEvent {
@@ -106,6 +144,7 @@ export interface NetworkEvent extends BaseEvent {
     responseStatus: number;
     responseHeaders: Record<string, string>;
     responseBody: string;
+    duration?: number;
     frameUrl?: string;
   };
 }
@@ -121,24 +160,20 @@ export interface ResizeEvent extends BaseEvent {
 
 export interface FocusEvent extends BaseEvent {
   type: 'Focus';
-  payload: {
-    selector: string;
-    frameUrl?: string;
-  };
+  payload: TargetPayload;
 }
 
 export interface BlurEvent extends BaseEvent {
   type: 'Blur';
-  payload: {
-    selector: string;
-    frameUrl?: string;
-  };
+  payload: TargetPayload;
 }
 
 export type RecordedEvent =
   | ClickEvent
   | DoubleClickEvent
   | InputEvent
+  | ChangeEvent
+  | FormSubmitEvent
   | ScrollEvent
   | MutationEvent
   | NavigationEvent
@@ -150,6 +185,8 @@ export type RecordedEvent =
 
 export type ClickPayload = ClickEvent['payload'];
 export type InputPayload = InputEvent['payload'];
+export type ChangePayload = ChangeEvent['payload'];
+export type SubmitPayload = FormSubmitEvent['payload'];
 export type ScrollPayload = ScrollEvent['payload'];
 export type MutationPayload = MutationEvent['payload'];
 export type NavigationPayload = NavigationEvent['payload'];
@@ -162,13 +199,24 @@ export interface SessionData {
   id: string;
   url: string;
   startTime: number;
+  endTime?: number;
+  initialState?: InitialStateSnapshot;
   events: RecordedEvent[];
   metadata: {
     userAgent: string;
     viewport: { width: number; height: number };
     totalEvents: number;
     duration: number;
+    pageUrls: string[];
+    cookiesCaptured?: string;
+    replayIssues?: number;
   };
+  replayErrors?: {
+    eventId: string;
+    eventType: EventType;
+    error: string;
+    timestamp: number;
+  }[];
 }
 
 export interface ReplayState {

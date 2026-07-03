@@ -247,6 +247,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case 'REPLAY_FINISHED':
       console.log('[ReplayX BG] Replay finished');
+      const errors = message.errors || [];
+      if (activeReplaySessionId) {
+        getSession(activeReplaySessionId).then((session) => {
+          if (session) {
+            session.metadata.replayIssues = errors.length;
+            session.replayErrors = errors.map((err: any) => ({
+              eventId: err.event?.id || '',
+              eventType: err.event?.type || 'Unknown',
+              error: err.error,
+              timestamp: err.event?.timestamp || Date.now()
+            }));
+            saveSession(session).catch((saveError) => {
+              console.warn('[ReplayX BG] Failed to save replay errors:', saveError);
+            });
+          }
+        }).catch((loadError) => {
+          console.warn('[ReplayX BG] Failed to load session for replay finish:', loadError);
+        });
+      }
       activeReplaySession = null;
       activeReplaySessionId = null;
       replayTabId = null;
@@ -385,19 +404,29 @@ async function handleStopRecording(sendResponse: (response: any) => void) {
         sessionState.events = sessionState.events.concat(response.events || []);
 
         const mergedEvents = sessionState.events;
+        const pageUrls = Array.from(new Set([
+          sessionState.url || '',
+          ...mergedEvents.filter(e => e.type === 'Navigation').map(e => (e.payload as any).url || '')
+        ])).filter(Boolean);
+        const endTime = Date.now();
 
         // Create session data
         const session: SessionData = {
           id: currentSessionId,
           url: sessionState.url || response.url || 'unknown',
           startTime: sessionState.startTime,
+          endTime,
+          initialState: response.initialState || undefined,
           events: mergedEvents,
           metadata: {
             userAgent: navigator.userAgent,
             viewport: response.viewport || { width: 0, height: 0 },
             totalEvents: mergedEvents.length,
             duration: mergedEvents.length > 0 ? Math.max(...mergedEvents.map((e: RecordedEvent) => e.timestamp)) -
-                     Math.min(...mergedEvents.map((e: RecordedEvent) => e.timestamp)) : 0
+                     Math.min(...mergedEvents.map((e: RecordedEvent) => e.timestamp)) : 0,
+            pageUrls,
+            cookiesCaptured: response.initialState?.cookies || undefined,
+            replayIssues: 0
           }
         };
 

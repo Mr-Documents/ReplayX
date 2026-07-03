@@ -1,4 +1,4 @@
-import { SessionData, RecordedEvent, ReplayState, ClickPayload, InputPayload, ScrollPayload, MutationPayload, NavigationPayload, FocusPayload, BlurPayload } from '../types';
+import { SessionData, RecordedEvent, ReplayState, ClickPayload, InputPayload, ChangePayload, SubmitPayload, ScrollPayload, MutationPayload, NavigationPayload, FocusPayload, BlurPayload } from '../types';
 
 export class Replayer {
   private isReplaying = false;
@@ -364,6 +364,10 @@ export class Replayer {
         return await this.executeKey(event);
       case 'Input':
         return await this.executeInput(event);
+      case 'Change':
+        return await this.executeChange(event);
+      case 'Submit':
+        return await this.executeSubmit(event);
       case 'Scroll':
         return await this.executeScroll(event);
       case 'Mutation':
@@ -384,14 +388,12 @@ export class Replayer {
   private async executeClick(event: RecordedEvent) {
     if (event.type !== 'Click') return;
     const payload = event.payload as ClickPayload;
-    const selector = payload.selector;
-    let element = await this.findElement({ selector, textSnippet: (payload as any).textSnippet });
+    let element = await this.findElement({ selector: payload.selector, fallbackSelectors: payload.fallbackSelectors, textSnippet: payload.textSnippet, name: payload.name, dataTestId: payload.dataTestId });
 
     if (!element) {
       const dom = document.body ? document.body.innerHTML.slice(0, 5000) : '';
-      console.warn('[ReplayX Replayer] Click target not found:', selector);
-      this.replayErrors.push({ event, error: 'target not found', });
-      // include snapshot as a best-effort property
+      console.warn('[ReplayX Replayer] Click target not found:', payload.selector);
+      this.replayErrors.push({ event, error: 'target not found' });
       try { (this.replayErrors[this.replayErrors.length-1] as any).dom = dom; } catch (e) {}
       return;
     }
@@ -429,13 +431,12 @@ export class Replayer {
   private async executeInput(event: RecordedEvent) {
     if (event.type !== 'Input') return;
     const payload = event.payload as InputPayload;
-    const selector = payload.selector;
     const value = payload.value;
-    let element = await this.findElement({ selector, textSnippet: (payload as any).textSnippet });
+    let element = await this.findElement({ selector: payload.selector, fallbackSelectors: payload.fallbackSelectors, textSnippet: payload.textSnippet, name: payload.name, dataTestId: payload.dataTestId });
 
     if (!element) {
       const dom = document.body ? document.body.innerHTML.slice(0, 5000) : '';
-      console.warn('[ReplayX Replayer] Input target not found:', selector);
+      console.warn('[ReplayX Replayer] Input target not found:', payload.selector);
       this.replayErrors.push({ event, error: 'input target not found' });
       try { (this.replayErrors[this.replayErrors.length-1] as any).dom = dom; } catch (e) {}
       return;
@@ -469,6 +470,48 @@ export class Replayer {
       if (element.value !== value) {
         element.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: value }));
         this.setNativeProps(element, 'value', value);
+      }
+    }
+  }
+
+  private async executeChange(event: RecordedEvent) {
+    if (event.type !== 'Change') return;
+    const payload = event.payload as ChangePayload;
+    let element = await this.findElement({ selector: payload.selector, fallbackSelectors: payload.fallbackSelectors, textSnippet: payload.textSnippet, name: payload.name, dataTestId: payload.dataTestId });
+    if (!element) {
+      const dom = document.body ? document.body.innerHTML.slice(0, 5000) : '';
+      console.warn('[ReplayX Replayer] Change target not found:', payload.selector);
+      this.replayErrors.push({ event, error: 'change target not found' });
+      try { (this.replayErrors[this.replayErrors.length-1] as any).dom = dom; } catch (e) {}
+      return;
+    }
+
+    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) {
+      this.setNativeProps(element, 'value', payload.value);
+      element.dispatchEvent(new Event('change', { bubbles: true }));
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+  }
+
+  private async executeSubmit(event: RecordedEvent) {
+    if (event.type !== 'Submit') return;
+    const payload = event.payload as SubmitPayload;
+    let element = await this.findElement({ selector: payload.selector, fallbackSelectors: payload.fallbackSelectors, textSnippet: payload.textSnippet, name: payload.name, dataTestId: payload.dataTestId });
+    if (!element) {
+      const dom = document.body ? document.body.innerHTML.slice(0, 5000) : '';
+      console.warn('[ReplayX Replayer] Submit target not found:', payload.selector);
+      this.replayErrors.push({ event, error: 'submit target not found' });
+      try { (this.replayErrors[this.replayErrors.length-1] as any).dom = dom; } catch (e) {}
+      return;
+    }
+
+    const form = element instanceof HTMLFormElement ? element : element.closest('form');
+    if (form) {
+      form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+      try {
+        form.requestSubmit?.();
+      } catch (e) {
+        /* ignore if not supported */
       }
     }
   }
@@ -509,7 +552,7 @@ export class Replayer {
     const scrollTop = payload.scrollTop;
     const scrollLeft = payload.scrollLeft;
 
-    let element = selector === 'window' ? window : await this.findElement(selector);
+    let element = selector === 'window' ? window : await this.findElement({ selector: payload.selector, fallbackSelectors: payload.fallbackSelectors, textSnippet: payload.textSnippet, name: payload.name, dataTestId: payload.dataTestId });
     if (!element) return;
 
     if (element === window) {
@@ -566,8 +609,7 @@ export class Replayer {
   private async executeFocus(event: RecordedEvent) {
     if (event.type !== 'Focus') return;
     const payload = event.payload as FocusPayload;
-    const selector = payload.selector;
-    let element = await this.findElement(selector) as HTMLElement;
+    let element = await this.findElement({ selector: payload.selector, fallbackSelectors: payload.fallbackSelectors, textSnippet: payload.textSnippet, name: payload.name, dataTestId: payload.dataTestId }) as HTMLElement;
     if (element) {
       element.focus();
     }
@@ -576,8 +618,7 @@ export class Replayer {
   private async executeBlur(event: RecordedEvent) {
     if (event.type !== 'Blur') return;
     const payload = event.payload as BlurPayload;
-    const selector = payload.selector;
-    let element = await this.findElement(selector) as HTMLElement;
+    let element = await this.findElement({ selector: payload.selector, fallbackSelectors: payload.fallbackSelectors, textSnippet: payload.textSnippet, name: payload.name, dataTestId: payload.dataTestId }) as HTMLElement;
     if (element) {
       element.blur();
     }
@@ -585,26 +626,33 @@ export class Replayer {
 
   private async findElement(selectorOrObj: any, timeoutMs: number = 3000): Promise<HTMLElement | null> {
     const selector = typeof selectorOrObj === 'string' ? selectorOrObj : selectorOrObj?.selector;
+    const fallbackSelectors: string[] = typeof selectorOrObj === 'object' ? selectorOrObj?.fallbackSelectors || [] : [];
     const textSnippet = typeof selectorOrObj === 'object' ? selectorOrObj?.textSnippet : undefined;
+    const name = typeof selectorOrObj === 'object' ? selectorOrObj?.name : undefined;
+    const dataTestId = typeof selectorOrObj === 'object' ? selectorOrObj?.dataTestId : undefined;
     const startTime = performance.now();
-    
+
+    const candidates = [selector, ...fallbackSelectors];
+    if (name) candidates.push(`${selectorOrObj.targetTag || '*'}[name="${name}"]`, `[name="${name}"]`);
+    if (dataTestId) candidates.push(`[data-testid="${dataTestId}"]`, `[data-cy="${dataTestId}"]`, `[data-test="${dataTestId}"]`, `[data-qa="${dataTestId}"]`);
+
     while (performance.now() - startTime < timeoutMs) {
       try {
-        let element = this.querySelectorDeep(selector);
-        if (!element) {
-          element = this.tryAlternativeSelectors(selector, textSnippet);
-        }
-        
-        // Ensure element exists and is interactable (or a functional hidden input/form element)
-        if (element && (this.isElementInteractable(element) || element.matches('input, textarea, select'))) {
-          return element;
+        for (const candidate of candidates) {
+          if (!candidate) continue;
+          let element = this.querySelectorDeep(candidate);
+          if (!element) {
+            element = this.tryAlternativeSelectors(candidate, textSnippet);
+          }
+          if (element && (this.isElementInteractable(element) || element.matches('input, textarea, select, form'))) {
+            return element;
+          }
         }
       } catch (e) {}
-      
-      // Wait 100ms (adjusted by speed) before retrying
+
       await this.delayMs(100);
     }
-    
+
     return null;
   }
 

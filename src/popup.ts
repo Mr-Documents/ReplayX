@@ -100,6 +100,8 @@ function renderSessions(sessions: SessionData[]) {
     const date = new Date(session.startTime).toLocaleString();
     const eventCount = session.events.length;
     const duration = session.metadata?.duration ? `${(session.metadata.duration / 1000).toFixed(1)}s` : 'Unknown';
+    const issueCount = session.replayErrors?.length || session.metadata?.replayIssues || 0;
+    const pageUrlCount = session.metadata?.pageUrls?.length || 0;
 
     let displayUrl = session.url;
     try {
@@ -115,7 +117,7 @@ function renderSessions(sessions: SessionData[]) {
       <div class="session-info">
         <strong>${date}</strong><br>
         URL: ${displayUrl}<br>
-        Events: ${eventCount} | Duration: ${duration}
+        Events: ${eventCount} | Duration: ${duration}${pageUrlCount > 1 ? ` | Pages: ${pageUrlCount}` : ''}${issueCount > 0 ? ` | Issues: ${issueCount}` : ''}
       </div>
       <div class="session-actions">
           <button class="replay-btn" data-id="${session.id}">Replay</button>
@@ -173,7 +175,7 @@ function viewSessionEvents(sessionId: string, containerEl: HTMLElement) {
       row.style.borderBottom = '1px solid #e2e8f0';
 
       const left = document.createElement('div');
-      left.innerHTML = `<strong>${ev.type}</strong> @ ${ev.timestamp}ms`;
+      left.innerHTML = `<strong>${ev.type}</strong> @ ${ev.timestamp}ms<br>${getEventSummary(ev)}`;
 
       const right = document.createElement('div');
       right.innerHTML = `
@@ -210,6 +212,27 @@ function viewSessionEvents(sessionId: string, containerEl: HTMLElement) {
 
     containerEl.appendChild(list);
   });
+}
+
+function getEventSummary(ev: any): string {
+  if (!ev || !ev.payload) return '';
+
+  switch (ev.type) {
+    case 'Click':
+    case 'DoubleClick':
+      return `Target: ${ev.payload.selector || 'unknown'}${ev.payload.textSnippet ? ` | text: ${ev.payload.textSnippet.slice(0, 40)}` : ''}`;
+    case 'Input':
+    case 'Change':
+      return `Target: ${ev.payload.selector || 'unknown'} | value: ${String(ev.payload.value).slice(0, 40)}`;
+    case 'Submit':
+      return `Form: ${ev.payload.selector || 'unknown'} | action: ${ev.payload.formAction || 'n/a'}`;
+    case 'Network':
+      return `Network: ${ev.payload.method} ${ev.payload.url} | status: ${ev.payload.responseStatus}`;
+    case 'Navigation':
+      return `Navigate to ${ev.payload.url}`;
+    default:
+      return ev.payload.selector ? `Target: ${ev.payload.selector}` : '';
+  }
 }
 
 function replaySession(sessionId: string) {
