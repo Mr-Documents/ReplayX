@@ -23,13 +23,15 @@ let currentState = {
   isReplaying: false,
   isReplayPaused: false,
   replaySpeed: 1,
-  sessions: [] as SessionData[]
+  sessions: [] as SessionData[],
+  showDebugger: false,
+  activeSessionId: null as string | null
 };
 
 function updateUI(updates: Partial<typeof currentState>) {
   currentState = { ...currentState, ...updates };
 
-  if (currentState.isReplaying) {
+  if (currentState.showDebugger || currentState.isReplaying) {
     debuggerPanel.style.display = 'block';
   } else {
     debuggerPanel.style.display = 'none';
@@ -90,10 +92,19 @@ function loadSessions() {
   });
 }
 
-function renderSessions(sessions: SessionData[]) {
-  sessionsContainer.innerHTML = '';
+function closeDebuggerPanel() {
+  currentState.showDebugger = false;
+  currentState.activeSessionId = null;
   debuggerPanel.innerHTML = '';
   debuggerPanel.style.display = 'none';
+}
+
+function renderSessions(sessions: SessionData[]) {
+  sessionsContainer.innerHTML = '';
+  if (!currentState.showDebugger) {
+    debuggerPanel.innerHTML = '';
+    debuggerPanel.style.display = 'none';
+  }
   if (sessions.length === 0) {
     sessionsContainer.innerHTML = '<span style="font-size: 12px; color: #a0aec0;">No sessions recorded yet.</span>';
     return;
@@ -143,15 +154,28 @@ function renderSessions(sessions: SessionData[]) {
 
     replayBtn.addEventListener('click', () => replaySession(session.id));
     const viewBtn = el.querySelector('.view-btn') as HTMLButtonElement;
-    viewBtn.addEventListener('click', () => viewSessionEvents(session.id, el));
+    viewBtn.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      viewSessionEvents(session.id, el);
+    });
     exportBtn.addEventListener('click', () => exportSession(session.id));
     deleteBtn.addEventListener('click', () => deleteSession(session.id, el));
 
     sessionsContainer.appendChild(el);
   });
+
+  if (currentState.showDebugger && currentState.activeSessionId) {
+    const activeSession = sessions.find(session => session.id === currentState.activeSessionId);
+    if (activeSession) {
+      renderDebugger(activeSession);
+    }
+  }
 }
 
 function renderDebugger(session: SessionData) {
+  currentState.showDebugger = true;
+  currentState.activeSessionId = session.id;
   debuggerPanel.style.display = 'block';
   debuggerPanel.innerHTML = `
     <div class="debugger-header">
@@ -160,6 +184,7 @@ function renderDebugger(session: SessionData) {
         <div class="debugger-subtitle">Session ${session.id.slice(0, 8)} • ${session.events.length} events</div>
       </div>
       <div class="debugger-actions">
+        <button id="close-debugger-btn">Close</button>
         <button id="restart-replay-btn">Replay from start</button>
       </div>
     </div>
@@ -181,6 +206,10 @@ function renderDebugger(session: SessionData) {
   const errorList = debuggerPanel.querySelector('#debugger-errors') as HTMLDivElement;
   const networkList = debuggerPanel.querySelector('#debugger-network') as HTMLDivElement;
   const restartBtn = debuggerPanel.querySelector('#restart-replay-btn') as HTMLButtonElement;
+  const closeBtn = debuggerPanel.querySelector('#close-debugger-btn') as HTMLButtonElement;
+
+  closeBtn.addEventListener('click', closeDebuggerPanel);
+  closeBtn.addEventListener('mousedown', (event) => event.preventDefault());
 
   restartBtn.addEventListener('click', () => {
     chrome.runtime.sendMessage({ action: 'REPLAY_SESSION', sessionId: session.id, speed: currentState.replaySpeed }, (res) => {
@@ -192,7 +221,7 @@ function renderDebugger(session: SessionData) {
 
   const errors = session.replayErrors || [];
   if (errors.length === 0) {
-    errorList.innerHTML = '<div class="debugger-item">No replay issues recorded.</div>';
+    errorList.innerHTML = '<div class="debugger-empty">No replay issues recorded for this session.</div>';
   } else {
     errorList.innerHTML = errors.slice(0, 8).map((err: any) => `
       <div class="debugger-item">
@@ -204,7 +233,7 @@ function renderDebugger(session: SessionData) {
 
   const networkEvents = session.events.filter((ev: any) => ev.type === 'Network');
   if (networkEvents.length === 0) {
-    networkList.innerHTML = '<div class="debugger-item">No network events were captured.</div>';
+    networkList.innerHTML = '<div class="debugger-empty">No network events were captured for this session.</div>';
   } else {
     networkList.innerHTML = networkEvents.slice(0, 8).map((ev: any) => `
       <div class="debugger-item">
@@ -216,6 +245,11 @@ function renderDebugger(session: SessionData) {
 }
 
 function viewSessionEvents(sessionId: string, containerEl: HTMLElement) {
+  if (currentState.activeSessionId === sessionId && currentState.showDebugger) {
+    closeDebuggerPanel();
+    return;
+  }
+
   // Request full session from background
   chrome.runtime.sendMessage({ action: 'GET_SESSION', sessionId }, (res) => {
     if (!res || !res.success) {
@@ -225,66 +259,6 @@ function viewSessionEvents(sessionId: string, containerEl: HTMLElement) {
 
     const session = res.session as SessionData;
     renderDebugger(session);
-    // Create event list element
-    let list = containerEl.querySelector('.event-list') as HTMLElement | null;
-    if (list) {
-      // Toggle
-      list.remove();
-      return;
-    }
-
-    list = document.createElement('div');
-    list.className = 'event-list';
-    list.style.padding = '8px 10px';
-    list.style.background = '#f7fafc';
-    list.style.marginTop = '8px';
-    list.style.borderRadius = '6px';
-    list.style.fontSize = '12px';
-
-    session.events.forEach((ev, idx) => {
-      const row = document.createElement('div');
-      row.style.display = 'flex';
-      row.style.justifyContent = 'space-between';
-      row.style.padding = '6px 0';
-      row.style.borderBottom = '1px solid #e2e8f0';
-
-      const left = document.createElement('div');
-      left.innerHTML = `<strong>${ev.type}</strong> @ ${ev.timestamp}ms<br>${getEventSummary(ev)}`;
-
-      const right = document.createElement('div');
-      right.innerHTML = `
-        <button class="replay-from" data-idx="${idx}" style="margin-right:6px;">Replay from here</button>
-        <button class="step-from" data-idx="${idx}">Step from here</button>
-      `;
-
-      right.querySelector('.replay-from')!.addEventListener('click', () => {
-        const speed = parseFloat((document.getElementById('speed-control') as HTMLInputElement).value);
-        chrome.runtime.sendMessage({ action: 'REPLAY_SESSION', sessionId, speed, startIndex: idx }, (res) => {
-          if (res && res.success) {
-            window.close();
-          } else {
-            alert('Failed to start replay: ' + (res?.error || 'Unknown error'));
-          }
-        });
-      });
-
-      right.querySelector('.step-from')!.addEventListener('click', () => {
-        const speed = parseFloat((document.getElementById('speed-control') as HTMLInputElement).value);
-        chrome.runtime.sendMessage({ action: 'REPLAY_SESSION', sessionId, speed, startIndex: idx, step: true }, (res) => {
-          if (res && res.success) {
-            window.close();
-          } else {
-            alert('Failed to start step replay: ' + (res?.error || 'Unknown error'));
-          }
-        });
-      });
-
-      row.appendChild(left);
-      row.appendChild(right);
-      list!.appendChild(row);
-    });
-
-    containerEl.appendChild(list);
   });
 }
 

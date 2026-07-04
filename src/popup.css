@@ -91,6 +91,9 @@ button:disabled {
   border-radius: 8px;
   padding: 10px;
   box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+  position: sticky;
+  bottom: 8px;
+  z-index: 2;
 }
 
 .debugger-header {
@@ -99,6 +102,8 @@ button:disabled {
   gap: 8px;
   align-items: flex-start;
   margin-bottom: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #edf2f7;
 }
 
 .debugger-title {
@@ -160,6 +165,16 @@ button:disabled {
   gap: 6px;
   max-height: 160px;
   overflow-y: auto;
+}
+
+.debugger-empty {
+  padding: 8px;
+  border: 1px dashed #e2e8f0;
+  border-radius: 5px;
+  background: #fcfdff;
+  color: #718096;
+  font-size: 11px;
+  text-align: center;
 }
 
 .debugger-item {
