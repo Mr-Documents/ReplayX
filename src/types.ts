@@ -131,6 +131,7 @@ export interface NavigationEvent extends BaseEvent {
     url: string;
     referrer?: string;
     frameUrl?: string;
+    navigationType?: 'navigate' | 'push' | 'replace' | 'back' | 'forward';
   };
 }
 
@@ -211,12 +212,17 @@ export interface SessionData {
     cookiesCaptured?: string;
     replayIssues?: number;
   };
-  replayErrors?: {
-    eventId: string;
-    eventType: EventType;
-    error: string;
-    timestamp: number;
-  }[];
+  replayErrors?: Array<{
+    eventId?: string;
+    eventType?: EventType;
+    code?: string;
+    message?: string;
+    details?: string;
+    stage?: string;
+    error?: string;
+    timestamp?: number;
+    dom?: string;
+  }>;
 }
 
 export interface ReplayState {

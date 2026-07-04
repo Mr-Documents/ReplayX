@@ -14,6 +14,7 @@ const speedValue = document.getElementById('speed-value') as HTMLSpanElement;
 const timeline = document.getElementById('timeline') as HTMLDivElement;
 const progressBar = document.getElementById('progress-bar') as HTMLDivElement;
 const stepBtn = document.getElementById('step-btn') as HTMLButtonElement | null;
+const debuggerPanel = document.getElementById('session-debugger') as HTMLDivElement;
 
 // State
 let currentState = {
@@ -27,6 +28,12 @@ let currentState = {
 
 function updateUI(updates: Partial<typeof currentState>) {
   currentState = { ...currentState, ...updates };
+
+  if (currentState.isReplaying) {
+    debuggerPanel.style.display = 'block';
+  } else {
+    debuggerPanel.style.display = 'none';
+  }
 
   // Recording controls
   startBtn.disabled = currentState.isRecording || currentState.isReplaying;
@@ -85,6 +92,8 @@ function loadSessions() {
 
 function renderSessions(sessions: SessionData[]) {
   sessionsContainer.innerHTML = '';
+  debuggerPanel.innerHTML = '';
+  debuggerPanel.style.display = 'none';
   if (sessions.length === 0) {
     sessionsContainer.innerHTML = '<span style="font-size: 12px; color: #a0aec0;">No sessions recorded yet.</span>';
     return;
@@ -142,6 +151,70 @@ function renderSessions(sessions: SessionData[]) {
   });
 }
 
+function renderDebugger(session: SessionData) {
+  debuggerPanel.style.display = 'block';
+  debuggerPanel.innerHTML = `
+    <div class="debugger-header">
+      <div>
+        <div class="debugger-title">Replay debugger</div>
+        <div class="debugger-subtitle">Session ${session.id.slice(0, 8)} • ${session.events.length} events</div>
+      </div>
+      <div class="debugger-actions">
+        <button id="restart-replay-btn">Replay from start</button>
+      </div>
+    </div>
+    <div class="debugger-summary">
+      <div class="debugger-chip">Events<br>${session.events.length}</div>
+      <div class="debugger-chip">Errors<br>${session.replayErrors?.length || 0}</div>
+      <div class="debugger-chip">Network<br>${session.events.filter(e => e.type === 'Network').length}</div>
+    </div>
+    <div class="debugger-section">
+      <div class="debugger-section-title">Recent issues</div>
+      <div class="debugger-list" id="debugger-errors"></div>
+    </div>
+    <div class="debugger-section">
+      <div class="debugger-section-title">Network log</div>
+      <div class="debugger-list" id="debugger-network"></div>
+    </div>
+  `;
+
+  const errorList = debuggerPanel.querySelector('#debugger-errors') as HTMLDivElement;
+  const networkList = debuggerPanel.querySelector('#debugger-network') as HTMLDivElement;
+  const restartBtn = debuggerPanel.querySelector('#restart-replay-btn') as HTMLButtonElement;
+
+  restartBtn.addEventListener('click', () => {
+    chrome.runtime.sendMessage({ action: 'REPLAY_SESSION', sessionId: session.id, speed: currentState.replaySpeed }, (res) => {
+      if (!res || !res.success) {
+        alert('Failed to restart replay: ' + (res?.error || 'Unknown error'));
+      }
+    });
+  });
+
+  const errors = session.replayErrors || [];
+  if (errors.length === 0) {
+    errorList.innerHTML = '<div class="debugger-item">No replay issues recorded.</div>';
+  } else {
+    errorList.innerHTML = errors.slice(0, 8).map((err: any) => `
+      <div class="debugger-item">
+        <strong>${err.message || err.error || 'Replay issue'}</strong><br>
+        ${err.details || ''}${err.code ? ` <br>Code: ${err.code}` : ''}
+      </div>
+    `).join('');
+  }
+
+  const networkEvents = session.events.filter((ev: any) => ev.type === 'Network');
+  if (networkEvents.length === 0) {
+    networkList.innerHTML = '<div class="debugger-item">No network events were captured.</div>';
+  } else {
+    networkList.innerHTML = networkEvents.slice(0, 8).map((ev: any) => `
+      <div class="debugger-item">
+        <strong>${ev.payload.method || 'GET'} ${ev.payload.url || ''}</strong><br>
+        Status: ${ev.payload.responseStatus || 'n/a'} • ${ev.payload.duration ? `${ev.payload.duration}ms` : 'timing unavailable'}
+      </div>
+    `).join('');
+  }
+}
+
 function viewSessionEvents(sessionId: string, containerEl: HTMLElement) {
   // Request full session from background
   chrome.runtime.sendMessage({ action: 'GET_SESSION', sessionId }, (res) => {
@@ -151,6 +224,7 @@ function viewSessionEvents(sessionId: string, containerEl: HTMLElement) {
     }
 
     const session = res.session as SessionData;
+    renderDebugger(session);
     // Create event list element
     let list = containerEl.querySelector('.event-list') as HTMLElement | null;
     if (list) {
@@ -244,6 +318,7 @@ function replaySession(sessionId: string) {
   }, (res) => {
     if (res && res.success) {
       updateUI({ isReplaying: true });
+      loadState();
       window.close(); // Close popup when replay starts
     } else {
       alert('Failed to start replay: ' + (res?.error || 'Unknown error'));

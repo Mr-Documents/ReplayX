@@ -255,8 +255,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             session.replayErrors = errors.map((err: any) => ({
               eventId: err.event?.id || '',
               eventType: err.event?.type || 'Unknown',
-              error: err.error,
-              timestamp: err.event?.timestamp || Date.now()
+              code: err.code,
+              message: err.message,
+              details: err.details,
+              stage: err.stage,
+              error: err.message || err.details || 'Replay failed',
+              timestamp: err.timestamp || err.event?.timestamp || Date.now(),
+              dom: err.dom
             }));
             saveSession(session).catch((saveError) => {
               console.warn('[ReplayX BG] Failed to save replay errors:', saveError);

@@ -25,6 +25,7 @@ export class Recorder {
   private sessionStartTime: number = 0;
   private isRecording = false;
   private isPaused = false;
+  private historyLength = 0;
   private initialState: any = null;
   private mutationObserver: MutationObserver | null = null;
   private scrollTimeout: number | null = null;
@@ -50,6 +51,7 @@ export class Recorder {
     this.sessionId = sessionId;
     this.events = [];
     this.sessionStartTime = sessionStartTime ?? Date.now();
+    this.historyLength = window.history.length;
 
     // MVP Improvement: Capture initial state correctly using helper
     this.initialState = {
@@ -401,6 +403,7 @@ export class Recorder {
   }
 
   private onNavigation(e?: Event) {
+    const navigationType = this.getNavigationType(e);
     this.addEvent({
       id: this.generateId(),
       sessionId: this.sessionId,
@@ -408,9 +411,25 @@ export class Recorder {
       type: 'Navigation',
       payload: {
         url: window.location.href,
-        referrer: document.referrer
+        referrer: document.referrer,
+        navigationType
       }
     });
+  }
+
+  private getNavigationType(e?: Event): 'navigate' | 'push' | 'replace' | 'back' | 'forward' {
+    if (e?.type === 'popstate') {
+      const currentLength = window.history.length;
+      const previousLength = this.historyLength;
+      this.historyLength = currentLength;
+      if (currentLength < previousLength) return 'back';
+      if (currentLength > previousLength) return 'forward';
+      return 'navigate';
+    }
+
+    if (e?.type === 'pushstate') return 'push';
+    if (e?.type === 'replacestate') return 'replace';
+    return 'navigate';
   }
 
   private generateId(): string {
@@ -435,12 +454,12 @@ export class Recorder {
 
     history.pushState = function(...args: any[]) {
       originalPushState.apply(this, args);
-      recorder.onNavigation();
+      recorder.onNavigation({ type: 'pushstate' } as Event);
     };
 
     history.replaceState = function(...args: any[]) {
       originalReplaceState.apply(this, args);
-      recorder.onNavigation();
+      recorder.onNavigation({ type: 'replacestate' } as Event);
     };
 
     (history.pushState as any)._isReplayXPatched = true;

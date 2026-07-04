@@ -30,7 +30,14 @@ export class Replayer {
   private isProcessingQueues = false;
 
   // Error tracking
-  private replayErrors: Array<{ event: RecordedEvent; error: string }> = [];
+  private replayErrors: Array<{
+    event: RecordedEvent;
+    code: string;
+    message: string;
+    details?: string;
+    stage?: string;
+    timestamp: number;
+  }> = [];
 
   private boundUnloadHandler = () => this.stop(false);
 
@@ -213,7 +220,7 @@ export class Replayer {
       }
     } catch (error) {
       console.error('[ReplayX Replayer] Step execution failed:', item.event, error);
-      this.replayErrors.push({ event: item.event, error: String(error) });
+      this.recordReplayError(item.event, 'step_failed', 'Replay step failed', error instanceof Error ? error.message : String(error), 'step');
       this.nextEventIndex += 1;
     }
   }
@@ -334,7 +341,7 @@ export class Replayer {
           }
         } catch (error) {
           console.error('[ReplayX Replayer] Event execution failed:', item.event, error);
-          this.replayErrors.push({ event: item.event, error: String(error) });
+          this.recordReplayError(item.event, 'event_failed', 'Replay event failed', error instanceof Error ? error.message : String(error), 'playback');
           this.nextEventIndex += 1;
         }
       }
@@ -393,8 +400,7 @@ export class Replayer {
     if (!element) {
       const dom = document.body ? document.body.innerHTML.slice(0, 5000) : '';
       console.warn('[ReplayX Replayer] Click target not found:', payload.selector);
-      this.replayErrors.push({ event, error: 'target not found' });
-      try { (this.replayErrors[this.replayErrors.length-1] as any).dom = dom; } catch (e) {}
+      this.recordReplayError(event, 'target_not_found', 'Click target was not found', 'The recorded selector could not be resolved during replay.', 'find', dom);
       return;
     }
 
@@ -425,7 +431,7 @@ export class Replayer {
     }
 
     // Wait for network or DOM settle heuristics
-    await this.waitForNetworkIdle(1500);
+    await this.waitForReplaySettling(1500);
   }
 
   private async executeInput(event: RecordedEvent) {
@@ -437,8 +443,7 @@ export class Replayer {
     if (!element) {
       const dom = document.body ? document.body.innerHTML.slice(0, 5000) : '';
       console.warn('[ReplayX Replayer] Input target not found:', payload.selector);
-      this.replayErrors.push({ event, error: 'input target not found' });
-      try { (this.replayErrors[this.replayErrors.length-1] as any).dom = dom; } catch (e) {}
+      this.recordReplayError(event, 'target_not_found', 'Input target was not found', 'The recorded selector could not be resolved during replay.', 'find', dom);
       return;
     }
 
@@ -481,8 +486,7 @@ export class Replayer {
     if (!element) {
       const dom = document.body ? document.body.innerHTML.slice(0, 5000) : '';
       console.warn('[ReplayX Replayer] Change target not found:', payload.selector);
-      this.replayErrors.push({ event, error: 'change target not found' });
-      try { (this.replayErrors[this.replayErrors.length-1] as any).dom = dom; } catch (e) {}
+      this.recordReplayError(event, 'target_not_found', 'Change target was not found', 'The recorded selector could not be resolved during replay.', 'find', dom);
       return;
     }
 
@@ -500,8 +504,7 @@ export class Replayer {
     if (!element) {
       const dom = document.body ? document.body.innerHTML.slice(0, 5000) : '';
       console.warn('[ReplayX Replayer] Submit target not found:', payload.selector);
-      this.replayErrors.push({ event, error: 'submit target not found' });
-      try { (this.replayErrors[this.replayErrors.length-1] as any).dom = dom; } catch (e) {}
+      this.recordReplayError(event, 'target_not_found', 'Submit target was not found', 'The recorded selector could not be resolved during replay.', 'find', dom);
       return;
     }
 
@@ -575,15 +578,26 @@ export class Replayer {
 
   private async executeNavigation(event: RecordedEvent) {
     if (event.type !== 'Navigation') return;
-    const payload = event.payload as NavigationPayload;
+    const payload = event.payload as NavigationPayload & { navigationType?: string };
     const url = payload.url;
-    
-    // Force navigation if the app didn't transition automatically
+    const navigationType = payload.navigationType || 'navigate';
+
+    if (navigationType === 'back') {
+      window.history.back();
+      await this.waitForReplaySettling(1000);
+      return true;
+    }
+
+    if (navigationType === 'forward') {
+      window.history.forward();
+      await this.waitForReplaySettling(1000);
+      return true;
+    }
+
     const normalize = (u: string) => u.replace(/\/$/, '').toLowerCase();
     if (normalize(window.location.href) !== normalize(url)) {
       console.log('[ReplayX Replayer] Redirecting to next page:', url);
-      // Navigate and wait for page load; let background/state handle resuming
-      window.location.href = url;
+      window.location.assign(url);
       return true;
     }
     return false;
@@ -599,6 +613,38 @@ export class Replayer {
       };
       check();
     });
+  }
+
+  private async waitForReplaySettling(timeoutMs: number = 2000): Promise<void> {
+    await this.waitForNetworkIdle(timeoutMs);
+    const startedAt = performance.now();
+    while (performance.now() - startedAt < timeoutMs) {
+      await this.delayMs(50);
+      if (document.readyState === 'complete') break;
+    }
+  }
+
+  private recordReplayError(
+    event: RecordedEvent,
+    code: string,
+    message: string,
+    details?: string,
+    stage: string = 'playback',
+    domSnippet?: string
+  ) {
+    const errorEntry = {
+      event,
+      code,
+      message,
+      details,
+      stage,
+      timestamp: Date.now()
+    } as const;
+
+    this.replayErrors.push(errorEntry as any);
+    if (domSnippet) {
+      (this.replayErrors[this.replayErrors.length - 1] as any).dom = domSnippet;
+    }
   }
 
   private async executeResize(event: RecordedEvent) {

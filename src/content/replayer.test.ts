@@ -65,6 +65,26 @@ describe('Replayer', () => {
     await promise;
   });
 
+  it('uses history.back for back navigation during replay', async () => {
+    const backSpy = vi.fn();
+    Object.defineProperty(window.history, 'back', {
+      configurable: true,
+      value: backSpy
+    });
+
+    const event: RecordedEvent = {
+      id: 'nav-1',
+      sessionId: 'session-1',
+      type: 'Navigation',
+      timestamp: 0,
+      payload: { url: 'https://example.com/previous', navigationType: 'back' }
+    };
+
+    await (replayer as any).executeNavigation(event);
+
+    expect(backSpy).toHaveBeenCalledOnce();
+  });
+
   it('dispatches a click event on the target element during replay', async () => {
     document.body.innerHTML = `<button id="btn">Replay</button>`;
     const button = document.getElementById('btn');
