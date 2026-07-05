@@ -175,8 +175,14 @@ button:disabled {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  max-height: 160px;
+  max-height: 180px;
   overflow-y: auto;
+  padding-right: 2px;
+}
+
+.debugger-item:hover {
+  border-color: #90cdf4;
+  background: #f0f9ff;
 }
 
 .debugger-empty {

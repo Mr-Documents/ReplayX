@@ -1,4 +1,4 @@
-import { SessionData, RecordedEvent, ReplayState, ClickPayload, InputPayload, ChangePayload, SubmitPayload, ScrollPayload, MutationPayload, NavigationPayload, FocusPayload, BlurPayload } from '../types';
+import { SessionData, RecordedEvent, ReplayState, ClickPayload, InputPayload, ChangePayload, SubmitPayload, ScrollPayload, MutationPayload, NavigationPayload, FocusPayload, BlurPayload, ReplayErrorEntry } from '../types';
 
 export class Replayer {
   private isReplaying = false;
@@ -20,7 +20,11 @@ export class Replayer {
   private replayStartTime: number = 0;
   private session: SessionData | null = null;
   private startIndex: number = 0;
-  private pendingMockCount: number = 0;
+  private pendingNetworkRequests: number = 0;
+  private lastNetworkActivityAt: number = 0;
+  private lastDomMutationAt: number = 0;
+  private domMutationCount: number = 0;
+  private domStabilityObserver: MutationObserver | null = null;
 
   public onStop?: () => void;
 
@@ -94,6 +98,12 @@ export class Replayer {
 
     console.log('[ReplayX Replayer] Starting deterministic replay for session:', session.id);
 
+    this.pendingNetworkRequests = 0;
+    this.lastNetworkActivityAt = performance.now();
+    this.lastDomMutationAt = performance.now();
+    this.domMutationCount = 0;
+    this.setupDomStabilityObserver();
+
     // Configure network interceptor
     window.postMessage({
       source: 'replayx-content',
@@ -105,10 +115,7 @@ export class Replayer {
       }))
     }, '*');
 
-    // Track how many network mocks are available to be consumed
-    this.pendingMockCount = session.events.filter(e => e.type === 'Network').length;
-
-    // Listen for interceptor messages about mocks being consumed
+    // Listen for interceptor messages about network activity and mocks being consumed
     window.addEventListener('message', this.boundInterceptorMessage);
 
     this.createCursor();
@@ -127,8 +134,13 @@ export class Replayer {
     try {
       if (!ev.data || ev.data.source !== 'replayx-interceptor') return;
       if (ev.data.action === 'MOCK_CONSUMED') {
-        // A mock was consumed; decrement pending count if present
-        this.pendingMockCount = Math.max(0, this.pendingMockCount - 1);
+        this.lastNetworkActivityAt = performance.now();
+      } else if (ev.data.action === 'NETWORK_REQUEST_STARTED') {
+        this.pendingNetworkRequests = Math.max(0, this.pendingNetworkRequests + 1);
+        this.lastNetworkActivityAt = performance.now();
+      } else if (ev.data.action === 'NETWORK_REQUEST_FINISHED' || ev.data.action === 'NETWORK_REQUEST_FAILED') {
+        this.pendingNetworkRequests = Math.max(0, this.pendingNetworkRequests - 1);
+        this.lastNetworkActivityAt = performance.now();
       }
     } catch (e) {}
   }
@@ -146,6 +158,7 @@ export class Replayer {
     window.removeEventListener('beforeunload', this.boundUnloadHandler);
     this.microtaskQueue = [];
     this.macrotaskQueue = [];
+    this.disconnectDomStabilityObserver();
 
     if (this.cursor) {
       this.cursor.remove();
@@ -400,7 +413,14 @@ export class Replayer {
     if (!element) {
       const dom = document.body ? document.body.innerHTML.slice(0, 5000) : '';
       console.warn('[ReplayX Replayer] Click target not found:', payload.selector);
-      this.recordReplayError(event, 'target_not_found', 'Click target was not found', 'The recorded selector could not be resolved during replay.', 'find', dom);
+      this.recordReplayError(event, 'target_not_found', 'Click target was not found', 'The recorded selector could not be resolved during replay. The selector may have changed or the element may not yet exist.', 'find', dom, {
+        retryable: true,
+        severity: 'error',
+        selector: payload.selector,
+        targetTag: payload.targetTag,
+        expected: 'A visible target element matching the recorded selector',
+        actual: 'No matching element could be resolved during replay'
+      });
       return;
     }
 
@@ -443,7 +463,14 @@ export class Replayer {
     if (!element) {
       const dom = document.body ? document.body.innerHTML.slice(0, 5000) : '';
       console.warn('[ReplayX Replayer] Input target not found:', payload.selector);
-      this.recordReplayError(event, 'target_not_found', 'Input target was not found', 'The recorded selector could not be resolved during replay.', 'find', dom);
+      this.recordReplayError(event, 'target_not_found', 'Input target was not found', 'The recorded selector could not be resolved during replay. The form control may have changed or not yet rendered.', 'find', dom, {
+        retryable: true,
+        severity: 'error',
+        selector: payload.selector,
+        targetTag: payload.targetTag,
+        expected: 'A visible input-like element matching the recorded selector',
+        actual: 'No matching input element could be resolved during replay'
+      });
       return;
     }
 
@@ -476,6 +503,7 @@ export class Replayer {
         element.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: value }));
         this.setNativeProps(element, 'value', value);
       }
+      await this.waitForReplaySettling(1800, { eventType: 'input' });
     }
   }
 
@@ -486,7 +514,14 @@ export class Replayer {
     if (!element) {
       const dom = document.body ? document.body.innerHTML.slice(0, 5000) : '';
       console.warn('[ReplayX Replayer] Change target not found:', payload.selector);
-      this.recordReplayError(event, 'target_not_found', 'Change target was not found', 'The recorded selector could not be resolved during replay.', 'find', dom);
+      this.recordReplayError(event, 'target_not_found', 'Change target was not found', 'The recorded selector could not be resolved during replay. The target may have been replaced by a dynamic framework update.', 'find', dom, {
+        retryable: true,
+        severity: 'error',
+        selector: payload.selector,
+        targetTag: payload.targetTag,
+        expected: 'A visible form control matching the recorded selector',
+        actual: 'No matching control could be resolved during replay'
+      });
       return;
     }
 
@@ -504,7 +539,14 @@ export class Replayer {
     if (!element) {
       const dom = document.body ? document.body.innerHTML.slice(0, 5000) : '';
       console.warn('[ReplayX Replayer] Submit target not found:', payload.selector);
-      this.recordReplayError(event, 'target_not_found', 'Submit target was not found', 'The recorded selector could not be resolved during replay.', 'find', dom);
+      this.recordReplayError(event, 'target_not_found', 'Submit target was not found', 'The recorded selector could not be resolved during replay. The form or button may no longer exist in the same DOM position.', 'find', dom, {
+        retryable: true,
+        severity: 'error',
+        selector: payload.selector,
+        targetTag: payload.targetTag,
+        expected: 'A visible form or submit control matching the recorded selector',
+        actual: 'No matching form control could be resolved during replay'
+      });
       return;
     }
 
@@ -516,6 +558,7 @@ export class Replayer {
       } catch (e) {
         /* ignore if not supported */
       }
+      await this.waitForReplaySettling(1800, { eventType: 'submit' });
     }
   }
 
@@ -584,13 +627,13 @@ export class Replayer {
 
     if (navigationType === 'back') {
       window.history.back();
-      await this.waitForReplaySettling(1000);
+      await this.waitForReplaySettling(1800, { eventType: 'navigation' });
       return true;
     }
 
     if (navigationType === 'forward') {
       window.history.forward();
-      await this.waitForReplaySettling(1000);
+      await this.waitForReplaySettling(1800, { eventType: 'navigation' });
       return true;
     }
 
@@ -598,6 +641,7 @@ export class Replayer {
     if (normalize(window.location.href) !== normalize(url)) {
       console.log('[ReplayX Replayer] Redirecting to next page:', url);
       window.location.assign(url);
+      await this.waitForReplaySettling(2500, { eventType: 'navigation' });
       return true;
     }
     return false;
@@ -607,7 +651,9 @@ export class Replayer {
     const start = performance.now();
     return new Promise((resolve) => {
       const check = () => {
-        if (this.pendingMockCount <= 0) return resolve();
+        const networkIdle = this.pendingNetworkRequests <= 0;
+        const settledWindowElapsed = performance.now() - this.lastNetworkActivityAt > 120;
+        if (networkIdle && settledWindowElapsed) return resolve();
         if (performance.now() - start > timeoutMs) return resolve();
         setTimeout(check, 50);
       };
@@ -615,12 +661,16 @@ export class Replayer {
     });
   }
 
-  private async waitForReplaySettling(timeoutMs: number = 2000): Promise<void> {
-    await this.waitForNetworkIdle(timeoutMs);
+  private async waitForReplaySettling(timeoutMs: number = 2000, options: { eventType?: string } = {}): Promise<void> {
+    const effectiveTimeout = Math.max(timeoutMs, options.eventType === 'navigation' ? 2500 : 1200);
+    await this.waitForNetworkIdle(effectiveTimeout);
+
     const startedAt = performance.now();
-    while (performance.now() - startedAt < timeoutMs) {
+    while (performance.now() - startedAt < effectiveTimeout) {
       await this.delayMs(50);
-      if (document.readyState === 'complete') break;
+      const domSettled = this.domMutationCount === 0 || performance.now() - this.lastDomMutationAt > 120;
+      const networkSettled = this.pendingNetworkRequests === 0 || performance.now() - this.lastNetworkActivityAt > 120;
+      if (document.readyState === 'complete' && domSettled && networkSettled) break;
     }
   }
 
@@ -630,16 +680,24 @@ export class Replayer {
     message: string,
     details?: string,
     stage: string = 'playback',
-    domSnippet?: string
+    domSnippet?: string,
+    context?: Partial<ReplayErrorEntry>
   ) {
-    const errorEntry = {
-      event,
+    const errorEntry: ReplayErrorEntry = {
+      eventId: event.id,
+      eventType: event.type,
       code,
       message,
       details,
       stage,
-      timestamp: Date.now()
-    } as const;
+      timestamp: Date.now(),
+      retryable: context?.retryable ?? false,
+      severity: context?.severity ?? 'warning',
+      selector: context?.selector,
+      targetTag: context?.targetTag,
+      expected: context?.expected,
+      actual: context?.actual
+    };
 
     this.replayErrors.push(errorEntry as any);
     if (domSnippet) {
@@ -881,6 +939,27 @@ export class Replayer {
       document.removeEventListener('keydown', handler);
       originalStop(isFinished);
     };
+  }
+
+  private setupDomStabilityObserver() {
+    if (this.domStabilityObserver || !document.body) return;
+
+    this.domStabilityObserver = new MutationObserver(() => {
+      this.domMutationCount += 1;
+      this.lastDomMutationAt = performance.now();
+    });
+
+    this.domStabilityObserver.observe(document.body, {
+      childList: true,
+      attributes: true,
+      characterData: true,
+      subtree: true
+    });
+  }
+
+  private disconnectDomStabilityObserver() {
+    this.domStabilityObserver?.disconnect();
+    this.domStabilityObserver = null;
   }
 
   private delayMs(ms: number): Promise<void> {

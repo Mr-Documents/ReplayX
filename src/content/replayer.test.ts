@@ -114,4 +114,29 @@ describe('Replayer', () => {
 
     expect(clickSpy).toHaveBeenCalledOnce();
   });
+
+  it('captures richer context for replay failures', async () => {
+    document.body.innerHTML = '<div></div>';
+
+    const event: RecordedEvent = {
+      id: 'click-missing',
+      sessionId: 'session-1',
+      type: 'Click',
+      timestamp: 0,
+      payload: { selector: '#missing-button', x: 0, y: 0, targetTag: 'button' }
+    };
+
+    await (replayer as any).executeClick(event);
+
+    const errors = (replayer as any).replayErrors;
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({
+      code: 'target_not_found',
+      message: 'Click target was not found',
+      stage: 'find',
+      selector: '#missing-button',
+      retryable: true
+    });
+    expect(errors[0].details).toContain('selector');
+  });
 });

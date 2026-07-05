@@ -203,12 +203,17 @@ function renderDebugger(session: SessionData) {
       <div class="debugger-list" id="debugger-errors"></div>
     </div>
     <div class="debugger-section">
+      <div class="debugger-section-title">Event timeline</div>
+      <div class="debugger-list" id="debugger-events"></div>
+    </div>
+    <div class="debugger-section">
       <div class="debugger-section-title">Network log</div>
       <div class="debugger-list" id="debugger-network"></div>
     </div>
   `;
 
   const errorList = debuggerPanel.querySelector('#debugger-errors') as HTMLDivElement;
+  const eventList = debuggerPanel.querySelector('#debugger-events') as HTMLDivElement;
   const networkList = debuggerPanel.querySelector('#debugger-network') as HTMLDivElement;
   const restartBtn = debuggerPanel.querySelector('#restart-replay-btn') as HTMLButtonElement;
   const closeBtn = debuggerPanel.querySelector('#close-debugger-btn') as HTMLButtonElement;
@@ -229,11 +234,23 @@ function renderDebugger(session: SessionData) {
   } else {
     errorList.innerHTML = errors.slice(0, 8).map((err: any) => `
       <div class="debugger-item">
-        <strong>${err.message || err.error || 'Replay issue'}</strong><br>
-        ${err.details || ''}${err.code ? ` <br>Code: ${err.code}` : ''}
+        <strong>${err.message || err.error || 'Replay issue'}</strong>
+        <div class="debugger-meta">${err.severity || 'warning'} • ${err.stage || 'playback'}${err.code ? ` • ${err.code}` : ''}</div>
+        <div class="debugger-body">${(err.details || '').replace(/\n/g, '<br>')} ${err.selector ? `<br>Selector: ${err.selector}` : ''} ${err.expected ? `<br>Expected: ${err.expected}` : ''} ${err.actual ? `<br>Actual: ${err.actual}` : ''}</div>
       </div>
     `).join('');
   }
+
+  const recentEvents = session.events.slice(0, 8);
+  eventList.innerHTML = recentEvents.length === 0
+    ? '<div class="debugger-empty">No events were captured for this session.</div>'
+    : recentEvents.map((ev: any) => `
+        <div class="debugger-item">
+          <strong>${ev.type}</strong>
+          <div class="debugger-meta">${ev.timestamp ?? 'n/a'}ms</div>
+          <div class="debugger-body">${getEventSummary(ev)}</div>
+        </div>
+      `).join('');
 
   if (networkEvents.length === 0) {
     networkList.innerHTML = '<div class="debugger-empty">No network events were captured for this session.</div>';

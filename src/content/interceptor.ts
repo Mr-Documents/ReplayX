@@ -13,6 +13,15 @@
   let replayNetworkEvents: any[] = [];
   let replayIndex = 0;
   const consumedEventIds = new Set<string>();
+  let requestCounter = 0;
+
+  function postRequestLifecycle(action: 'NETWORK_REQUEST_STARTED' | 'NETWORK_REQUEST_FINISHED' | 'NETWORK_REQUEST_FAILED', requestId?: string) {
+    window.postMessage({
+      source: 'replayx-interceptor',
+      action,
+      requestId
+    }, '*');
+  }
 
   window.addEventListener('message', (event) => {
     if (event.data && event.data.source === 'replayx-content') {
@@ -35,7 +44,9 @@
     const requestStartMs = Date.now();
     const requestStartPerf = performance.now();
 
+    const requestId = `fetch-${++requestCounter}`;
     if (mode === 'REPLAY') {
+      postRequestLifecycle('NETWORK_REQUEST_STARTED', requestId);
       // Match on body as well for deterministic replay of mutations (POST/GraphQL)
       const requestBody = await extractRequestBody(input, init);
       
@@ -48,9 +59,15 @@
           try {
             window.postMessage({ source: 'replayx-interceptor', action: 'MOCK_CONSUMED', id: mockEvent.id }, '*');
           } catch (e) {}
-        return createMockResponse(mockEvent);
+        const response = createMockResponse(mockEvent);
+        queueMicrotask(() => postRequestLifecycle('NETWORK_REQUEST_FINISHED', requestId));
+        return response;
       }
       console.warn(`[ReplayX] No mock found for fetch: ${method} ${url}, passing through`);
+    }
+
+    if (mode === 'RECORD') {
+      postRequestLifecycle('NETWORK_REQUEST_STARTED', requestId);
     }
 
     const startTime = requestStartMs;
@@ -92,6 +109,7 @@
       }
     }
 
+    queueMicrotask(() => postRequestLifecycle('NETWORK_REQUEST_FINISHED', requestId));
     return response;
   };
 
@@ -156,7 +174,9 @@
       }
     }
 
+    const requestId = `xhr-${++requestCounter}`;
     if (mode === 'REPLAY') {
+      postRequestLifecycle('NETWORK_REQUEST_STARTED', requestId);
       // Mock XHR response
       const mockEvent = findMatchingNetworkEvent(instance.method, instance.url, instance.requestBody);
       
@@ -165,13 +185,15 @@
         try {
           window.postMessage({ source: 'replayx-interceptor', action: 'MOCK_CONSUMED', id: mockEvent.id }, '*');
         } catch (e) {}
-        mockXHRResponse(xhr, mockEvent);
+        mockXHRResponse(xhr, mockEvent, () => postRequestLifecycle('NETWORK_REQUEST_FINISHED', requestId));
         return;
       }
       console.warn(`[ReplayX] No mock found for XHR: ${instance.method} ${instance.url}, passing through`);
+      postRequestLifecycle('NETWORK_REQUEST_FINISHED', requestId);
     }
 
     if (mode === 'RECORD') {
+      postRequestLifecycle('NETWORK_REQUEST_STARTED', requestId);
       // Set up response capture
       const originalOnLoad = xhr.onload;
       const originalOnReadyStateChange = xhr.onreadystatechange;
@@ -194,6 +216,7 @@
               responseHeaders: sanitizeHeaders(responseHeaders || {}),
               responseBody: sanitizeBody(xhr.responseText || '')
             }, '*');
+            postRequestLifecycle('NETWORK_REQUEST_FINISHED', requestId);
           } catch (error) {
             console.error('[ReplayX] Error recording XHR:', error);
           }
@@ -284,7 +307,7 @@
     });
   }
 
-  function mockXHRResponse(xhr: XMLHttpRequest, event: any) {
+  function mockXHRResponse(xhr: XMLHttpRequest, event: any, onComplete?: () => void) {
     // Simulate XHR events for mocking
     Object.defineProperty(xhr, 'status', { value: event.responseStatus, writable: false });
     Object.defineProperty(xhr, 'statusText', { value: event.responseStatus >= 400 ? 'Error' : 'OK', writable: false });
@@ -330,6 +353,7 @@
       if (xhr.onload) {
         xhr.onload(new ProgressEvent('load', { lengthComputable: false, loaded: 0, total: 0 }));
       }
+      onComplete?.();
     }, 0);
   }
 

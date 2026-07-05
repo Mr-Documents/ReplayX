@@ -196,6 +196,24 @@ export type ResizePayload = ResizeEvent['payload'];
 export type FocusPayload = FocusEvent['payload'];
 export type BlurPayload = BlurEvent['payload'];
 
+export interface ReplayErrorEntry {
+  eventId?: string;
+  eventType?: EventType;
+  code?: string;
+  message?: string;
+  details?: string;
+  stage?: string;
+  error?: string;
+  timestamp?: number;
+  dom?: string;
+  selector?: string;
+  retryable?: boolean;
+  severity?: 'info' | 'warning' | 'error';
+  targetTag?: string;
+  expected?: string;
+  actual?: string;
+}
+
 export interface SessionData {
   id: string;
   url: string;
@@ -212,17 +230,7 @@ export interface SessionData {
     cookiesCaptured?: string;
     replayIssues?: number;
   };
-  replayErrors?: Array<{
-    eventId?: string;
-    eventType?: EventType;
-    code?: string;
-    message?: string;
-    details?: string;
-    stage?: string;
-    error?: string;
-    timestamp?: number;
-    dom?: string;
-  }>;
+  replayErrors?: ReplayErrorEntry[];
 }
 
 export interface ReplayState {
