@@ -139,4 +139,16 @@ describe('Replayer', () => {
     });
     expect(errors[0].details).toContain('selector');
   });
+
+  it('detects a replay mismatch when the DOM stays unchanged after an interaction', () => {
+    const before = '<button id="btn">Open</button>';
+    const after = '<button id="btn">Open</button>';
+
+    const mismatch = (replayer as any).detectDomMismatch(before, after, { eventType: 'Click' });
+
+    expect(mismatch).toMatchObject({
+      hasMismatch: true,
+      code: 'dom_mismatch'
+    });
+  });
 });

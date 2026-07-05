@@ -666,12 +666,56 @@ export class Replayer {
     await this.waitForNetworkIdle(effectiveTimeout);
 
     const startedAt = performance.now();
+    const initialDomSnapshot = this.captureDomSnapshot();
     while (performance.now() - startedAt < effectiveTimeout) {
       await this.delayMs(50);
       const domSettled = this.domMutationCount === 0 || performance.now() - this.lastDomMutationAt > 120;
       const networkSettled = this.pendingNetworkRequests === 0 || performance.now() - this.lastNetworkActivityAt > 120;
+      const currentDomSnapshot = this.captureDomSnapshot();
+      const mismatch = this.detectDomMismatch(initialDomSnapshot, currentDomSnapshot, { eventType: options.eventType || 'interaction' });
+      if (mismatch.hasMismatch) {
+        this.recordReplayError({
+          id: `mismatch-${Date.now()}`,
+          sessionId: this.session?.id || 'unknown',
+          type: 'Mutation',
+          timestamp: Date.now(),
+          payload: {}
+        } as RecordedEvent, 'dom_mismatch', mismatch.message, mismatch.details, 'settle', currentDomSnapshot, {
+          retryable: true,
+          severity: 'warning',
+          expected: mismatch.expected,
+          actual: mismatch.actual
+        });
+        break;
+      }
       if (document.readyState === 'complete' && domSettled && networkSettled) break;
     }
+  }
+
+  private captureDomSnapshot(): string {
+    return document.body ? document.body.innerHTML.slice(0, 4000) : '';
+  }
+
+  private detectDomMismatch(before: string, after: string, context: { eventType?: string } = {}) {
+    const beforeTrimmed = before.replace(/\s+/g, ' ').trim();
+    const afterTrimmed = after.replace(/\s+/g, ' ').trim();
+
+    if (!beforeTrimmed && !afterTrimmed) {
+      return { hasMismatch: false, message: '', details: '', expected: '', actual: '', code: 'no_change' };
+    }
+
+    const changed = beforeTrimmed !== afterTrimmed;
+    const hasMismatch = !changed && context.eventType !== 'navigation';
+
+    return {
+      hasMismatch,
+      code: 'dom_mismatch',
+      message: hasMismatch ? 'Replay produced no observable DOM change after the interaction.' : '',
+      details: hasMismatch ? 'The page did not produce the expected DOM transition after this replay step.' : '',
+      expected: hasMismatch ? 'A DOM transition or state update following the replayed interaction' : '',
+      actual: hasMismatch ? 'DOM remained effectively unchanged after the interaction' : '',
+      target: context.eventType || 'interaction'
+    };
   }
 
   private recordReplayError(
