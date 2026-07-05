@@ -146,6 +146,18 @@ button:disabled {
   text-align: center;
 }
 
+.debugger-chip-warning {
+  background: #fff7ed;
+  border-color: #fdba74;
+  color: #9a2c00;
+}
+
+.debugger-chip-success {
+  background: #f0fff4;
+  border-color: #9ae6b4;
+  color: #22543d;
+}
+
 .debugger-section {
   margin-top: 8px;
   border-top: 1px solid #e2e8f0;
@@ -188,6 +200,21 @@ button:disabled {
 
 .debugger-item strong {
   color: #1f2937;
+}
+
+.debugger-meta {
+  display: inline-block;
+  margin-top: 2px;
+  color: #718096;
+  font-size: 10px;
+}
+
+.debugger-body {
+  margin-top: 4px;
+  color: #4a5568;
+  font-size: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 #speed-control {

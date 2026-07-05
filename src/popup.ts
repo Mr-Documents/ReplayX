@@ -1,5 +1,6 @@
 import './popup.css';
 import { SessionData } from './types';
+import { getEventDetailSummary, getReplayStatusBadge } from './debugger';
 
 // UI Elements
 const startBtn = document.getElementById('start-btn') as HTMLButtonElement;
@@ -177,6 +178,10 @@ function renderDebugger(session: SessionData) {
   currentState.showDebugger = true;
   currentState.activeSessionId = session.id;
   debuggerPanel.style.display = 'block';
+  const badge = getReplayStatusBadge(session);
+  const errors = session.replayErrors || [];
+  const networkEvents = session.events.filter((ev: any) => ev.type === 'Network');
+
   debuggerPanel.innerHTML = `
     <div class="debugger-header">
       <div>
@@ -190,8 +195,8 @@ function renderDebugger(session: SessionData) {
     </div>
     <div class="debugger-summary">
       <div class="debugger-chip">Events<br>${session.events.length}</div>
-      <div class="debugger-chip">Errors<br>${session.replayErrors?.length || 0}</div>
-      <div class="debugger-chip">Network<br>${session.events.filter(e => e.type === 'Network').length}</div>
+      <div class="debugger-chip ${badge.variant === 'warning' ? 'debugger-chip-warning' : 'debugger-chip-success'}">${badge.label}<br>${badge.count}</div>
+      <div class="debugger-chip">Network<br>${networkEvents.length}</div>
     </div>
     <div class="debugger-section">
       <div class="debugger-section-title">Recent issues</div>
@@ -219,7 +224,6 @@ function renderDebugger(session: SessionData) {
     });
   });
 
-  const errors = session.replayErrors || [];
   if (errors.length === 0) {
     errorList.innerHTML = '<div class="debugger-empty">No replay issues recorded for this session.</div>';
   } else {
@@ -231,16 +235,19 @@ function renderDebugger(session: SessionData) {
     `).join('');
   }
 
-  const networkEvents = session.events.filter((ev: any) => ev.type === 'Network');
   if (networkEvents.length === 0) {
     networkList.innerHTML = '<div class="debugger-empty">No network events were captured for this session.</div>';
   } else {
-    networkList.innerHTML = networkEvents.slice(0, 8).map((ev: any) => `
-      <div class="debugger-item">
-        <strong>${ev.payload.method || 'GET'} ${ev.payload.url || ''}</strong><br>
-        Status: ${ev.payload.responseStatus || 'n/a'} • ${ev.payload.duration ? `${ev.payload.duration}ms` : 'timing unavailable'}
-      </div>
-    `).join('');
+    networkList.innerHTML = networkEvents.slice(0, 8).map((ev: any) => {
+      const detail = getEventDetailSummary(ev);
+      return `
+        <div class="debugger-item">
+          <strong>${detail.title}</strong><br>
+          <span class="debugger-meta">${detail.meta}</span>
+          <div class="debugger-body">${detail.body.replace(/\n/g, '<br>')}</div>
+        </div>
+      `;
+    }).join('');
   }
 }
 
