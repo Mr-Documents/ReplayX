@@ -5,7 +5,7 @@
     "lib": ["ES2023", "DOM"],
     "types": ["vite/client", "chrome"],
     "skipLibCheck": true,
-    "strict": false,
+    "strict": true,
 
     /* Bundler mode */
     "moduleResolution": "bundler",
@@ -16,10 +16,12 @@
     "noEmit": true,
 
     /* Linting */
-    "noUnusedLocals": false,
-    "noUnusedParameters": false,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "erasableSyntaxOnly": true,
-    "noFallthroughCasesInSwitch": true
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+    "noUncheckedIndexedAccess": true
   },
   "include": ["src"]
 }

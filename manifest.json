@@ -10,8 +10,12 @@
     "downloads"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "http://*/*",
+    "https://*/*"
   ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' https://* http://*;"
+  },
   "icons": {
     "16": "public/favicon.svg",
     "48": "public/favicon.svg",
@@ -27,12 +31,12 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
+      "matches": ["http://*/*", "https://*/*"],
       "js": ["src/content/main.ts"],
       "run_at": "document_idle"
     },
     {
-      "matches": ["<all_urls>"],
+      "matches": ["http://*/*", "https://*/*"],
       "js": ["src/content/interceptor.ts"],
       "run_at": "document_start",
       "world": "MAIN"
@@ -41,7 +45,7 @@
   "web_accessible_resources": [
     {
       "resources": ["src/content/interceptor.ts"],
-      "matches": ["<all_urls>"]
+      "matches": ["http://*/*", "https://*/*"]
     }
   ]
 }

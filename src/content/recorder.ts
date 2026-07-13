@@ -1,22 +1,8 @@
 import {
   RecordedEvent,
-  ClickEvent,
-  InputEvent,
-  ChangeEvent,
-  FormSubmitEvent,
-  ScrollEvent,
-  MutationEvent,
-  NavigationEvent,
-  ResizeEvent,
-  FocusEvent,
-  BlurEvent,
   TargetPayload,
-  ClickPayload,
-  InputPayload,
-  ChangePayload,
-  SubmitPayload
+  MutationEvent
 } from '../types';
-import { SessionData } from '../types';
 
 export class Recorder {
   private events: RecordedEvent[] = [];
@@ -29,6 +15,18 @@ export class Recorder {
   private initialState: any = null;
   private mutationObserver: MutationObserver | null = null;
   private scrollTimeout: number | null = null;
+  
+  // Memory management limits
+  private readonly MAX_EVENTS = 50000; // Maximum events per session
+  private readonly MAX_SESSION_SIZE = 50 * 1024 * 1024; // 50MB max session size
+  private readonly FLUSH_THRESHOLD = 1000; // Flush events to background every 1000 events
+  private currentSessionSize = 0;
+
+  // Rate limiting
+  private readonly SCROLL_DEBOUNCE_MS = 100;
+  private readonly INPUT_DEBOUNCE_MS = 50;
+  private lastScrollTime = 0;
+  private lastInputTime = 0;
 
   // Event handlers
   private boundClickHandler = this.onClick.bind(this);
@@ -121,6 +119,9 @@ export class Recorder {
       this.scrollTimeout = null;
     }
 
+    // Flush any remaining events before stopping
+    this.flushEventsToBackground();
+
     const result = {
       events: this.events,
       startTime: this.sessionStartTime,
@@ -128,6 +129,7 @@ export class Recorder {
     };
     this.events = [];
     this.initialState = null;
+    this.currentSessionSize = 0;
     console.log('[ReplayX Recorder] Stopped recording, captured', result.events.length, 'events');
     return result;
   }
@@ -147,12 +149,49 @@ export class Recorder {
     if ((window as any)._replayx_is_replaying) return;
 
     if (this.isRecording && !this.isPaused) {
+      // Check memory limits
+      if (this.events.length >= this.MAX_EVENTS) {
+        console.warn('[ReplayX Recorder] Maximum event limit reached, stopping recording');
+        this.stop();
+        return;
+      }
+
+      const eventSize = JSON.stringify(event).length;
+      if (this.currentSessionSize + eventSize > this.MAX_SESSION_SIZE) {
+        console.warn('[ReplayX Recorder] Maximum session size reached, stopping recording');
+        this.stop();
+        return;
+      }
+
       // assign monotonic sequence number
       this.sequenceCounter += 1;
       (event as any).sequence = this.sequenceCounter;
       // Guard 2: Tag the event with the current frame's URL for deterministic replay
       event.payload.frameUrl = window.location.href;
       this.events.push(event);
+      this.currentSessionSize += eventSize;
+
+      // Flush events to background periodically to manage memory
+      if (this.events.length >= this.FLUSH_THRESHOLD) {
+        this.flushEventsToBackground();
+      }
+    }
+  }
+
+  private flushEventsToBackground() {
+    if (this.events.length === 0) return;
+    
+    const eventsToFlush = this.flushEvents();
+    if (eventsToFlush.length > 0) {
+      chrome.runtime.sendMessage({
+        action: 'SAVE_RECORDING_EVENTS',
+        sessionId: this.sessionId,
+        events: eventsToFlush
+      }, () => {
+        if (chrome.runtime.lastError) {
+          console.warn('[ReplayX Recorder] Failed to flush events:', chrome.runtime.lastError.message);
+        }
+      });
     }
   }
 
@@ -225,6 +264,13 @@ export class Recorder {
   }
 
   private onInput(e: Event) {
+    // Rate limit input events
+    const now = Date.now();
+    if (now - this.lastInputTime < this.INPUT_DEBOUNCE_MS) {
+      return; // Skip this input event if too recent
+    }
+    this.lastInputTime = now;
+
     const target = e.target as HTMLElement;
     const inputTarget = target as HTMLInputElement;
     const selectorPayload = this.buildTargetPayload(target);
@@ -346,6 +392,13 @@ export class Recorder {
     
     const selector = this.getRobustSelector(target);
 
+    // Rate limit scroll events using debounce
+    const now = Date.now();
+    if (now - this.lastScrollTime < this.SCROLL_DEBOUNCE_MS) {
+      return; // Skip this scroll event if too recent
+    }
+    this.lastScrollTime = now;
+
     // Debounce scroll events
     if (this.scrollTimeout) clearTimeout(this.scrollTimeout);
     this.scrollTimeout = window.setTimeout(() => {
@@ -360,7 +413,7 @@ export class Recorder {
           scrollLeft: target.scrollLeft || window.scrollX
         }
       });
-    }, 100);
+    }, this.SCROLL_DEBOUNCE_MS);
   }
 
   private onResize() {
@@ -452,12 +505,12 @@ export class Recorder {
     const originalPushState = history.pushState;
     const originalReplaceState = history.replaceState;
 
-    history.pushState = function(...args: any[]) {
+    history.pushState = function(...args: Parameters<typeof history.pushState>) {
       originalPushState.apply(this, args);
       recorder.onNavigation({ type: 'pushstate' } as Event);
     };
 
-    history.replaceState = function(...args: any[]) {
+    history.replaceState = function(...args: Parameters<typeof history.replaceState>) {
       originalReplaceState.apply(this, args);
       recorder.onNavigation({ type: 'replacestate' } as Event);
     };
@@ -555,7 +608,7 @@ export class Recorder {
       fallbackSelectors: this.getFallbackSelectors(el, selector),
       id,
       name,
-      dataTestId,
+      dataTestId: dataTestId || undefined,
       targetTag: el.tagName.toLowerCase(),
       textSnippet: (el.textContent || '').trim().slice(0, 120),
       frameUrl: window.location.href

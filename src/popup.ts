@@ -1,6 +1,7 @@
 import './popup.css';
 import { SessionData } from './types';
 import { getEventDetailSummary, getReplayStatusBadge } from './debugger';
+import { validateSessionData, sanitizeSessionData } from './validation';
 
 // UI Elements
 const startBtn = document.getElementById('start-btn') as HTMLButtonElement;
@@ -12,8 +13,6 @@ const statusText = document.getElementById('status') as HTMLSpanElement;
 const replayControls = document.getElementById('replay-controls') as HTMLDivElement;
 const speedControl = document.getElementById('speed-control') as HTMLInputElement;
 const speedValue = document.getElementById('speed-value') as HTMLSpanElement;
-const timeline = document.getElementById('timeline') as HTMLDivElement;
-const progressBar = document.getElementById('progress-bar') as HTMLDivElement;
 const stepBtn = document.getElementById('step-btn') as HTMLButtonElement | null;
 const debuggerPanel = document.getElementById('session-debugger') as HTMLDivElement;
 
@@ -268,7 +267,7 @@ function renderDebugger(session: SessionData) {
   }
 }
 
-function viewSessionEvents(sessionId: string, containerEl: HTMLElement) {
+function viewSessionEvents(sessionId: string, _containerEl: HTMLElement) {
   if (currentState.activeSessionId === sessionId && currentState.showDebugger) {
     closeDebuggerPanel();
     return;
@@ -399,11 +398,28 @@ importInput.addEventListener('change', (e) => {
   const file = (e.target as HTMLInputElement).files?.[0];
   if (!file) return;
 
+  // Validate file size (max 50MB)
+  if (file.size > 50 * 1024 * 1024) {
+    alert('File too large. Maximum size is 50MB.');
+    return;
+  }
+
   const reader = new FileReader();
   reader.onload = (e) => {
     try {
       const sessionData = JSON.parse(e.target?.result as string);
-      chrome.runtime.sendMessage({ action: 'IMPORT_SESSION', sessionData }, (res) => {
+      
+      // Validate session structure and security
+      const validation = validateSessionData(sessionData);
+      if (!validation.valid) {
+        alert('Invalid session data:\n' + validation.errors.join('\n'));
+        return;
+      }
+
+      // Sanitize the session data to remove any sensitive information
+      const sanitizedSession = sanitizeSessionData(sessionData);
+      
+      chrome.runtime.sendMessage({ action: 'IMPORT_SESSION', sessionData: sanitizedSession }, (res) => {
         if (res && res.success) {
           loadSessions();
           alert('Session imported successfully!');
@@ -412,7 +428,7 @@ importInput.addEventListener('change', (e) => {
         }
       });
     } catch (error) {
-      alert('Invalid JSON file');
+      alert('Invalid JSON file: ' + (error instanceof Error ? error.message : 'Unknown error'));
     }
   };
   reader.readAsText(file);

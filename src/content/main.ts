@@ -1,6 +1,6 @@
 import { Recorder } from './recorder';
 import { Replayer } from './replayer';
-import { SessionData, NetworkEvent } from '../types';
+import { SessionData } from '../types';
 
 const recorder = new Recorder();
 const replayer = new Replayer();
@@ -109,7 +109,7 @@ chrome.runtime.sendMessage({ action: 'GET_STATE' }, (state: any) => {
 });
 
 // Message handlers
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   // Return true to keep message channel open for async responses
   switch (message.action) {
     case 'START_RECORD':
@@ -124,7 +124,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
       } catch (error) {
         console.error('[ReplayX] Error starting recording:', error);
-        sendResponse({ success: false, error: error.message });
+        sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
       }
       break;
 
@@ -142,7 +142,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
       } catch (error) {
         console.error('[ReplayX] Error stopping recording:', error);
-        sendResponse({ success: false, error: error.message });
+        sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
       }
       break;
 
@@ -151,7 +151,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         recorder.pause();
         sendResponse({ success: true });
       } catch (error) {
-        sendResponse({ success: false, error: error.message });
+        sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
       }
       break;
 
@@ -160,7 +160,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         recorder.resume();
         sendResponse({ success: true });
       } catch (error) {
-        sendResponse({ success: false, error: error.message });
+        sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
       }
       break;
 
@@ -172,7 +172,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       } catch (error) {
         console.error('[ReplayX] Error starting replay:', error);
         updateWidgetState(false);
-        sendResponse({ success: false, error: error.message });
+        sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
       }
       break;
 
@@ -183,7 +183,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ success: true });
       } catch (error) {
         console.error('[ReplayX] Error stopping replay:', error);
-        sendResponse({ success: false, error: error.message });
+        sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
       }
       break;
 
@@ -192,7 +192,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         replayer.pause();
         sendResponse({ success: true });
       } catch (error) {
-        sendResponse({ success: false, error: error.message });
+        sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
       }
       break;
 
@@ -201,7 +201,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         replayer.resume();
         sendResponse({ success: true });
       } catch (error) {
-        sendResponse({ success: false, error: error.message });
+        sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
       }
       break;
 
@@ -211,7 +211,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ success: true });
       } catch (error) {
         console.error('[ReplayX] Error setting replay speed:', error);
-        sendResponse({ success: false, error: error.message });
+        sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
       }
       break;
 
@@ -222,7 +222,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 // Support stepping the replay from background
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse): boolean => {
   if (message.action === 'STEP_REPLAY') {
     try {
       replayer.step();
@@ -232,6 +232,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     return true;
   }
+  return false;
 });
 
 /**

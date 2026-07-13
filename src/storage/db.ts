@@ -9,6 +9,11 @@ const CHUNKS_STORE = 'chunks';
 const CHUNK_SIZE = 100; // Events per chunk
 const COMPRESSION_THRESHOLD = 1024; // Compress if payload > 1KB
 
+// Data retention policy
+const MAX_SESSIONS = 100; // Maximum number of sessions to keep
+const MAX_SESSION_AGE_DAYS = 30; // Delete sessions older than 30 days
+const AUTO_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // Run cleanup daily
+
 function openDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
@@ -270,11 +275,110 @@ function decompressEvent(event: RecordedEvent): RecordedEvent {
 }
 
 // Delta encoding for DOM mutations (future enhancement)
-export function createDeltaMutation(previousState: string, currentState: string): string {
+export function createDeltaMutation(_previousState: string, currentState: string): string {
   // Simple diff - in production, use proper diff algorithm
   return currentState; // Placeholder
 }
 
-export function applyDeltaMutation(baseState: string, delta: string): string {
+export function applyDeltaMutation(_baseState: string, delta: string): string {
   return delta; // Placeholder
+}
+
+/**
+ * Data retention cleanup function
+ * Deletes old sessions and enforces maximum session count
+ */
+export async function cleanupOldSessions(): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([SESSIONS_STORE, EVENTS_STORE, CHUNKS_STORE], 'readwrite');
+    const sessionsStore = transaction.objectStore(SESSIONS_STORE);
+    
+    // Get all sessions
+    const getAllRequest = sessionsStore.getAll();
+    getAllRequest.onsuccess = () => {
+      const sessions = getAllRequest.result as SessionData[];
+      const now = Date.now();
+      const maxAgeMs = MAX_SESSION_AGE_DAYS * 24 * 60 * 60 * 1000;
+      
+      // Filter sessions to delete
+      const sessionsToDelete = sessions.filter(session => {
+        const sessionAge = now - (session.startTime || 0);
+        return sessionAge > maxAgeMs;
+      });
+      
+      // If we have too many sessions, delete the oldest ones
+      if (sessions.length > MAX_SESSIONS) {
+        const sortedByAge = [...sessions].sort((a, b) => (a.startTime || 0) - (b.startTime || 0));
+        const excessCount = sessions.length - MAX_SESSIONS;
+        const oldestSessions = sortedByAge.slice(0, excessCount);
+        
+        oldestSessions.forEach(session => {
+          if (!sessionsToDelete.find(s => s.id === session.id)) {
+            sessionsToDelete.push(session);
+          }
+        });
+      }
+      
+      // Delete the sessions
+      if (sessionsToDelete.length === 0) {
+        resolve();
+        return;
+      }
+      
+      let deletedCount = 0;
+      sessionsToDelete.forEach(session => {
+        const deleteRequest = sessionsStore.delete(session.id);
+        deleteRequest.onsuccess = () => {
+          // Also delete associated events and chunks using cursor
+          const eventsStore = transaction.objectStore(EVENTS_STORE);
+          const chunksStore = transaction.objectStore(CHUNKS_STORE);
+          
+          const eventIndex = eventsStore.index('sessionId');
+          const chunkIndex = chunksStore.index('sessionId');
+          
+          // Delete events
+          const eventCursorRequest = eventIndex.openCursor(IDBKeyRange.only(session.id));
+          eventCursorRequest.onsuccess = () => {
+            const eventCursor = eventCursorRequest.result;
+            if (eventCursor) {
+              eventCursor.delete();
+              eventCursor.continue();
+            }
+          };
+          
+          // Delete chunks
+          const chunkCursorRequest = chunkIndex.openCursor(IDBKeyRange.only(session.id));
+          chunkCursorRequest.onsuccess = () => {
+            const chunkCursor = chunkCursorRequest.result;
+            if (chunkCursor) {
+              chunkCursor.delete();
+              chunkCursor.continue();
+            }
+          };
+          
+          deletedCount++;
+          if (deletedCount === sessionsToDelete.length) {
+            console.log(`[ReplayX DB] Cleaned up ${deletedCount} old sessions`);
+            resolve();
+          }
+        };
+        deleteRequest.onerror = () => reject(deleteRequest.error);
+      });
+    };
+    getAllRequest.onerror = () => reject(getAllRequest.error);
+  });
+}
+
+/**
+ * Initialize automatic cleanup schedule
+ */
+export function scheduleAutoCleanup(): void {
+  setInterval(async () => {
+    try {
+      await cleanupOldSessions();
+    } catch (error) {
+      console.error('[ReplayX DB] Auto-cleanup failed:', error);
+    }
+  }, AUTO_CLEANUP_INTERVAL_MS);
 }

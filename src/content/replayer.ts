@@ -43,6 +43,11 @@ export class Replayer {
     timestamp: number;
   }> = [];
 
+  // Retry configuration
+  private readonly MAX_RETRIES = 3;
+  private readonly RETRY_DELAY_MS = 500;
+  private retryCount = new Map<string, number>();
+
   private boundUnloadHandler = () => this.stop(false);
 
   async start(session: SessionData & { initialState?: any }, options: { speed?: number; isResume?: boolean; resumeIndex?: number } = {}) {
@@ -67,20 +72,51 @@ export class Replayer {
 
     // Restore initial state only when we are replaying from the first recorded page.
     if (session.initialState && !isResuming && isSessionStartPage) {
-      console.log('[ReplayX Replayer] Initial state found. Clearing and restoring storage...');
+      console.log('[ReplayX Replayer] Initial state found. Selectively restoring storage...');
       
-      // Clear current state to ensure determinism
-      localStorage.clear();
-      sessionStorage.clear();
+      // Only clear and restore keys that were actually recorded in the session
+      // This prevents destroying user data that wasn't part of the recording
+      const recordedLocalKeys = Object.keys(session.initialState.localStorage || {});
+      const recordedSessionKeys = Object.keys(session.initialState.sessionStorage || []);
+
+      // Clear only recorded keys from localStorage
+      recordedLocalKeys.forEach(key => {
+        try {
+          localStorage.removeItem(key);
+        } catch (e) {
+          console.warn('[ReplayX Replayer] Failed to clear localStorage key:', key);
+        }
+      });
+
+      // Clear only recorded keys from sessionStorage
+      recordedSessionKeys.forEach(key => {
+        try {
+          sessionStorage.removeItem(key);
+        } catch (e) {
+          console.warn('[ReplayX Replayer] Failed to clear sessionStorage key:', key);
+        }
+      });
 
       // Restore localStorage safely
       if (session.initialState.localStorage) {
-        Object.entries(session.initialState.localStorage).forEach(([k, v]) => localStorage.setItem(k, v as string));
+        Object.entries(session.initialState.localStorage).forEach(([k, v]) => {
+          try {
+            localStorage.setItem(k, v as string);
+          } catch (e) {
+            console.warn('[ReplayX Replayer] Failed to restore localStorage key:', k);
+          }
+        });
       }
 
       // Restore sessionStorage safely
       if (session.initialState.sessionStorage) {
-        Object.entries(session.initialState.sessionStorage).forEach(([k, v]) => sessionStorage.setItem(k, v as string));
+        Object.entries(session.initialState.sessionStorage).forEach(([k, v]) => {
+          try {
+            sessionStorage.setItem(k, v as string);
+          } catch (e) {
+            console.warn('[ReplayX Replayer] Failed to restore sessionStorage key:', k);
+          }
+        });
       }
       
       // Set control flag AFTER restoration so it isn't wiped
@@ -159,6 +195,7 @@ export class Replayer {
     this.microtaskQueue = [];
     this.macrotaskQueue = [];
     this.disconnectDomStabilityObserver();
+    this.retryCount.clear();
 
     if (this.cursor) {
       this.cursor.remove();
@@ -212,6 +249,8 @@ export class Replayer {
     if (this.nextEventIndex >= this.eventQueue.length) return;
 
     const item = this.eventQueue[this.nextEventIndex];
+    if (!item) return;
+    
     try {
       const navigationTriggered = await this.executeEvent(item.event);
       item.executed = true;
@@ -270,8 +309,9 @@ export class Replayer {
       console.log('[ReplayX Replayer] Resuming from event index', this.startIndex, 'for', window.location.href);
     }
 
-    const eventsToSchedule = events.slice(this.startIndex);
-    const offset = eventsToSchedule.length > 0 ? eventsToSchedule[0].timestamp : 0;
+    const eventsToSchedule = events.slice(this.startIndex ?? 0);
+    const firstEvent = eventsToSchedule[0];
+    const offset = firstEvent?.timestamp ?? 0;
 
     this.eventQueue = eventsToSchedule.map(event => ({
       event,
@@ -287,7 +327,10 @@ export class Replayer {
   private findResumeIndex(events: RecordedEvent[]): number {
     const currentUrl = this.normalizeUrl(window.location.href);
     for (let i = 0; i < events.length; i++) {
-      const frameUrl = this.normalizeUrl(events[i].payload.frameUrl || '');
+      const event = events[i];
+      const payload = event?.payload;
+      if (!payload) continue;
+      const frameUrl = this.normalizeUrl(payload.frameUrl || '');
       if (frameUrl && frameUrl === currentUrl) {
         return i;
       }
@@ -296,7 +339,7 @@ export class Replayer {
   }
 
   private normalizeUrl(url: string): string {
-    return url.split('#')[0].replace(/\/$/, '').toLowerCase();
+    return (url.split('#')[0] || url).replace(/\/$/, '').toLowerCase();
   }
 
   private persistReplayProgress(progressIndex: number) {
@@ -320,18 +363,20 @@ export class Replayer {
       }
 
       const currentTime = (performance.now() - this.replayStartTime) * this.state.speed;
-      this.state.currentTime = currentTime;
+      this.state.currentTime = currentTime ?? 0;
 
       // Execute due events in queue order
-      while (this.nextEventIndex < this.eventQueue.length &&
-             !this.eventQueue[this.nextEventIndex].executed &&
-             this.eventQueue[this.nextEventIndex].scheduledTime <= currentTime) {
-        const item = this.eventQueue[this.nextEventIndex];
+      while (this.nextEventIndex < this.eventQueue.length) {
+        const currentItem = this.eventQueue[this.nextEventIndex];
+        if (!currentItem || currentItem.executed || currentItem.scheduledTime > currentTime) break;
+        
+        const item = currentItem;
         
         // Frame Safety: Only execute events that belong to THIS frame
         if (item.event.payload.frameUrl) {
-          const normalize = (u: string) => u.split('#')[0].replace(/\/$/, '').toLowerCase();
-          if (normalize(item.event.payload.frameUrl) !== normalize(window.location.href)) {
+          const normalize = (u: string) => (u.split('#')[0] || u).replace(/\/$/, '').toLowerCase();
+          const frameUrl = item.event.payload.frameUrl;
+          if (frameUrl && normalize(frameUrl) !== normalize(window.location.href)) {
             item.executed = true;
             this.nextEventIndex += 1;
             continue;
@@ -375,33 +420,110 @@ export class Replayer {
   }
 
   private async executeEvent(event: RecordedEvent): Promise<boolean | void> {
-    switch (event.type) {
-      case 'Click':
-        return await this.executeClick(event);
-      case 'DoubleClick':
-        return await this.executeClick(event);
-      case 'Key':
-        return await this.executeKey(event);
-      case 'Input':
-        return await this.executeInput(event);
-      case 'Change':
-        return await this.executeChange(event);
-      case 'Submit':
-        return await this.executeSubmit(event);
-      case 'Scroll':
-        return await this.executeScroll(event);
-      case 'Mutation':
-        return await this.executeMutation(event);
-      case 'Navigation':
-        return await this.executeNavigation(event);
-      case 'Resize':
-        return await this.executeResize(event);
-      case 'Focus':
-        return await this.executeFocus(event);
-      case 'Blur':
-        return await this.executeBlur(event);
-      default:
-        console.warn('[ReplayX Replayer] Unknown event type:', event.type);
+    const eventId = event.id;
+    
+    try {
+      let result;
+      switch (event.type) {
+        case 'Click':
+          result = await this.executeClickWithRetry(event);
+          break;
+        case 'DoubleClick':
+          result = await this.executeClickWithRetry(event);
+          break;
+        case 'Key':
+          result = await this.executeKey(event);
+          break;
+        case 'Input':
+          result = await this.executeInputWithRetry(event);
+          break;
+        case 'Change':
+          result = await this.executeChange(event);
+          break;
+        case 'Submit':
+          result = await this.executeSubmitWithRetry(event);
+          break;
+        case 'Scroll':
+          result = await this.executeScroll(event);
+          break;
+        case 'Mutation':
+          result = await this.executeMutation(event);
+          break;
+        case 'Navigation':
+          result = await this.executeNavigation(event);
+          break;
+        case 'Resize':
+          result = await this.executeResize(event);
+          break;
+        case 'Focus':
+          result = await this.executeFocus(event);
+          break;
+        case 'Blur':
+          result = await this.executeBlur(event);
+          break;
+        default:
+          console.warn('[ReplayX Replayer] Unknown event type:', event.type);
+      }
+      
+      // Reset retry count on success
+      this.retryCount.delete(eventId);
+      return result;
+    } catch (error) {
+      console.error('[ReplayX Replayer] Event execution failed:', event, error);
+      this.recordReplayError(event, 'event_failed', 'Replay event failed', error instanceof Error ? error.message : String(error), 'playback');
+      this.retryCount.delete(eventId);
+      throw error;
+    }
+  }
+
+  private async executeClickWithRetry(event: RecordedEvent): Promise<boolean | void> {
+    const eventId = event.id;
+    const currentRetries = this.retryCount.get(eventId) || 0;
+    
+    try {
+      return await this.executeClick(event);
+    } catch (error) {
+      if (currentRetries < this.MAX_RETRIES) {
+        this.retryCount.set(eventId, currentRetries + 1);
+        console.log(`[ReplayX Replayer] Retrying click event (attempt ${currentRetries + 1}/${this.MAX_RETRIES})`);
+        await this.delayMs(this.RETRY_DELAY_MS);
+        return await this.executeClickWithRetry(event);
+      }
+      throw error;
+    }
+  }
+
+  private async executeInputWithRetry(event: RecordedEvent): Promise<boolean | void> {
+    const eventId = event.id;
+    const currentRetries = this.retryCount.get(eventId) || 0;
+    
+    try {
+      return await this.executeInput(event);
+    } catch (error) {
+      if (currentRetries < this.MAX_RETRIES) {
+        this.retryCount.set(eventId, currentRetries + 1);
+        console.log(`[ReplayX Replayer] Retrying input event (attempt ${currentRetries + 1}/${this.MAX_RETRIES})`);
+        await this.delayMs(this.RETRY_DELAY_MS);
+        return await this.executeInputWithRetry(event);
+      }
+      throw error;
+    }
+  }
+
+  private async executeSubmitWithRetry(event: RecordedEvent): Promise<boolean | void> {
+    const eventId = event.id;
+    const currentRetries = this.retryCount.get(eventId) || 0;
+    
+    try {
+      return await this.executeSubmit(event);
+    } catch (error) {
+      if (currentRetries < this.MAX_RETRIES) {
+        this.retryCount.set(eventId, currentRetries + 1);
+        console.log(`[ReplayX Replayer] Retrying submit event (attempt ${currentRetries + 1}/${this.MAX_RETRIES})`);
+        await this.delayMs(this.RETRY_DELAY_MS);
+        return await this.executeSubmitWithRetry(event);
+      }
+      throw error;
     }
   }
 
@@ -815,7 +937,8 @@ export class Replayer {
 
     const elements = (root as Document).querySelectorAll('*');
     for (let i = 0; i < elements.length; i++) {
-      const shadowRoot = elements[i].shadowRoot;
+      const element = elements[i] as any;
+      const shadowRoot = element?.shadowRoot;
       if (shadowRoot) {
         const found = this.querySelectorDeep(selector, shadowRoot);
         if (found) return found;
@@ -858,14 +981,16 @@ export class Replayer {
 
     // Try ID
     const idMatch = originalSelector.match(/#([^ >]+)/);
-    if (idMatch) {
-      const element = this.querySelectorDeep(`#${idMatch[1]}`);
+    if (idMatch && idMatch[1]) {
+      const id = idMatch[1];
+      const element = this.querySelectorDeep(`#${id}`);
       if (element) return element;
     }
 
     // Try simplified selector
     const parts = originalSelector.split(' > ');
-    const lastPart = parts[parts.length - 1].split(':')[0];
+    const lastPart = parts[parts.length - 1]?.split(':')[0];
+    if (!lastPart) return null;
     let element = this.querySelectorDeep(lastPart);
     if (element) return element;
 

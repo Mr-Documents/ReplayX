@@ -7,11 +7,9 @@
   (window as any)._replayx_interceptor_loaded = true;
 
   const originalFetch = window.fetch;
-  const originalXHR = window.XMLHttpRequest;
 
   let mode: 'IDLE' | 'RECORD' | 'REPLAY' = 'IDLE';
   let replayNetworkEvents: any[] = [];
-  let replayIndex = 0;
   const consumedEventIds = new Set<string>();
   let requestCounter = 0;
 
@@ -29,7 +27,6 @@
         mode = event.data.mode;
         if (mode === 'REPLAY' && event.data.networkEvents) {
           replayNetworkEvents = event.data.networkEvents;
-          replayIndex = 0;
           consumedEventIds.clear();
           console.log('[ReplayX Interceptor] Loaded', replayNetworkEvents.length, 'network events for replay');
         }
@@ -138,7 +135,7 @@
       startTime: performance.now()
     });
 
-    return originalOpen.apply(xhr, [method, url, ...args]);
+    return originalOpen.apply(xhr, args as any);
   };
 
   XMLHttpRequest.prototype.setRequestHeader = function(header: string, value: string) {
@@ -165,7 +162,8 @@
       } else if (body instanceof FormData) {
         // Convert FormData to string representation
         const formData: Record<string, string> = {};
-        for (const [key, value] of body.entries()) {
+        // Use for-of loop to work around TypeScript FormData.entries() type issue
+        for (const [key, value] of (body as any).entries() as Iterable<[string, any]>) {
           formData[key] = value.toString();
         }
         instance.requestBody = JSON.stringify(formData);
@@ -223,13 +221,13 @@
         }
 
         if (originalOnReadyStateChange) {
-          originalOnReadyStateChange.apply(xhr, []);
+          originalOnReadyStateChange.call(xhr, new Event('readystatechange'));
         }
       };
 
       xhr.onload = function() {
         if (originalOnLoad) {
-          originalOnLoad.apply(xhr, []);
+          originalOnLoad.call(xhr, new ProgressEvent('load'));
         }
       };
     }
@@ -268,8 +266,36 @@
     const copy: Record<string, string> = {};
     for (const k of Object.keys(headers || {})) {
       const low = k.toLowerCase();
-      if (low === 'authorization' || low === 'cookie' || low === 'set-cookie') continue;
-      copy[k] = headers[k];
+      // Expanded list of sensitive headers to filter
+      const sensitiveHeaders = [
+        'authorization',
+        'cookie',
+        'set-cookie',
+        'proxy-authorization',
+        'www-authenticate',
+        'x-api-key',
+        'x-auth-token',
+        'x-csrf-token',
+        'x-xsrf-token',
+        'x-access-token',
+        'x-refresh-token',
+        'x-session-id',
+        'x-session-token',
+        'x-authentication',
+        'x-token',
+        'api-key',
+        'secret',
+        'private-key',
+        'access-token',
+        'refresh-token',
+        'id-token',
+        'bearer'
+      ];
+      if (sensitiveHeaders.includes(low)) continue;
+      const value = headers[k];
+      if (value !== undefined) {
+        copy[k] = value;
+      }
     }
     return copy;
   }
@@ -279,15 +305,66 @@
     try {
       if (typeof body === 'string' && (body.trim().startsWith('{') || body.trim().startsWith('['))) {
         const parsed = JSON.parse(body);
-        // Mask common sensitive keys
-        const sensitive = ['password', 'card', 'cc', 'cvv', 'token'];
-        const maskObj = (obj: any) => {
+        // Expanded list of sensitive keys to mask
+        const sensitive = [
+          'password',
+          'card',
+          'cc',
+          'cvv',
+          'token',
+          'secret',
+          'apikey',
+          'api_key',
+          'api-key',
+          'accesskey',
+          'access_key',
+          'access-key',
+          'privatekey',
+          'private_key',
+          'private-key',
+          'sessionid',
+          'session_id',
+          'session-id',
+          'auth',
+          'authorization',
+          'bearer',
+          'refresh',
+          'refresh_token',
+          'refresh-token',
+          'id_token',
+          'id-token',
+          'ssn',
+          'socialsecurity',
+          'creditcard',
+          'credit_card',
+          'credit-card',
+          'bankaccount',
+          'bank_account',
+          'bank-account',
+          'pin',
+          'otp',
+          'totp',
+          'mfa',
+          '2fa',
+          'personal',
+          'confidential',
+          'sensitive'
+        ];
+        const maskObj = (obj: any): any => {
           if (Array.isArray(obj)) return obj.map(maskObj);
           if (obj && typeof obj === 'object') {
             const out: any = {};
             for (const k of Object.keys(obj)) {
-              if (sensitive.includes(k.toLowerCase())) out[k] = '*****';
-              else out[k] = maskObj(obj[k]);
+              const keyLower = k.toLowerCase();
+              // Check for exact matches and partial matches (e.g., 'password_reset_token')
+              const isSensitive = sensitive.some(s => 
+                keyLower === s || keyLower.includes(s) || keyLower.startsWith(s + '_') || keyLower.endsWith('_' + s)
+              );
+              if (isSensitive) {
+                out[k] = '*****';
+              } else {
+                out[k] = maskObj(obj[k]);
+              }
             }
             return out;
           }
@@ -295,7 +372,9 @@
         };
         return JSON.stringify(maskObj(parsed));
       }
-    } catch (e) {}
+    } catch (e) {
+      console.warn('[ReplayX] Failed to sanitize body:', e);
+    }
     return body;
   }
 
@@ -390,7 +469,8 @@
       if (init.body instanceof URLSearchParams) return init.body.toString();
       if (init.body instanceof FormData) {
         const data: Record<string, string> = {};
-        for (const [key, value] of init.body.entries()) {
+        // Use for-of loop to work around TypeScript FormData.entries() type issue
+        for (const [key, value] of (init.body as any).entries() as Iterable<[string, any]>) {
           data[key] = value.toString();
         }
         return JSON.stringify(data);
