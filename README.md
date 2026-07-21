@@ -6,7 +6,7 @@ This project is designed for product engineers, QA teams, and frontend developer
 
 ## Why ReplayX
 
-Modern web apps are complex: stateful UIs, client-side routing, async network requests, DOM mutations, and timing-sensitive interactions make debugging difficult. ReplayX addresses this by turning a real session into a replayable artifact that can be inspected, resumed, and debugged.
+Modern web applications are complex: stateful UIs, client-side routing, async network requests, DOM mutations, and timing-sensitive interactions make debugging difficult. ReplayX addresses this by turning a real session into a replayable artifact that can be inspected, resumed, and debugged.
 
 Key outcomes include:
 - Deterministic replay of recorded user behavior
