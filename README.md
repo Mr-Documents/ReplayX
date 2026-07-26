@@ -137,10 +137,10 @@ npm run build
 
 ### Load in Chrome
 
-1. Open Chrome and navigate to chrome://extensions
-2. Enable Developer mode
-3. Choose Load unpacked
-4. Select the generated dist directory from this project
+1. Open Chrome and navigate to chrome://extensions.
+2. Enable Developer mode.
+3. Choose Load unpacked.
+4. Select the generated dist directory. from this project.
 
 ### Run tests
 
