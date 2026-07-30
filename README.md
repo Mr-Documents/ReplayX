@@ -158,7 +158,7 @@ npm run dev
 
 ReplayX is intentionally local-first. All session data is stored in the browser using IndexedDB, which makes it practical for debugging without a backend or remote service.
 
-For best replay fidelity:
+For the best replay fidelity:
 - Prefer stable selectors and semantic markup
 - Avoid nondeterministic UI behavior during recording
 - Keep test data predictable when reproducing regressions
