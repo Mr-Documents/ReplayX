@@ -168,18 +168,33 @@ export function installInterceptor(win: Window & typeof globalThis = window): In
 
     if (mode === 'REPLAY') {
       lifecycle('NETWORK_REQUEST_STARTED', requestId);
+      let mock;
       try {
-        const requestBody = await extractRequestBody(input, init);
-        const mock = findMatchingNetworkEvent(method, url, requestBody);
-        if (mock) {
-          post({ action: 'MOCK_CONSUMED', id: mock.id });
-          return createMockResponse(mock);
-        }
-        console.warn(`[ReplayX] No mock for ${method} ${url}; passing through`);
-      } finally {
-        lifecycle('NETWORK_REQUEST_FINISHED', requestId);
+        mock = findMatchingNetworkEvent(method, url, await extractRequestBody(input, init));
+      } catch (error) {
+        lifecycle('NETWORK_REQUEST_FAILED', requestId);
+        throw error;
       }
-      return originalFetch.call(win, input, init);
+
+      if (mock) {
+        post({ action: 'MOCK_CONSUMED', id: mock.id });
+        lifecycle('NETWORK_REQUEST_FINISHED', requestId);
+        return createMockResponse(mock);
+      }
+
+      // Unmocked requests still hit the network, so the request is only settled
+      // once that real response arrives. Signalling FINISHED before awaiting it
+      // let the replayer treat the network as idle mid-flight.
+      console.warn(`[ReplayX] No mock for ${method} ${url}; passing through`);
+      try {
+        const response = await originalFetch.call(win, input, init);
+        lifecycle('NETWORK_REQUEST_FINISHED', requestId);
+        return response;
+      } catch (error) {
+        // Exactly one settle per request: FAILED here, never FAILED then FINISHED.
+        lifecycle('NETWORK_REQUEST_FAILED', requestId);
+        throw error;
+      }
     }
 
     // RECORD

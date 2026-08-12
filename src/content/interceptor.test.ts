@@ -242,6 +242,63 @@ describe('fetch in REPLAY mode', () => {
     expect(await response.text()).toBe('live');
   });
 
+  it('settles an unmocked request only after the real response arrives', async () => {
+    // Signalling FINISHED before awaiting the pass-through let the replayer see
+    // the network as idle while a request was still in flight.
+    let resolveFetch: (response: Response) => void = () => {};
+    window.fetch = (() =>
+      new Promise<Response>((resolve) => {
+        resolveFetch = resolve;
+      })) as unknown as typeof window.fetch;
+    const posted = vi.spyOn(window, 'postMessage');
+
+    handle = installInterceptor(window);
+    setMode('REPLAY', [mock]);
+
+    const pending = window.fetch('https://example.com/unmocked');
+    await Promise.resolve();
+
+    const actionsMidFlight = posted.mock.calls.map(([m]) => (m as { action?: string })?.action);
+    expect(actionsMidFlight).toContain('NETWORK_REQUEST_STARTED');
+    expect(actionsMidFlight).not.toContain('NETWORK_REQUEST_FINISHED');
+
+    resolveFetch(new Response('live'));
+    await pending;
+
+    const actionsAfter = posted.mock.calls.map(([m]) => (m as { action?: string })?.action);
+    expect(actionsAfter).toContain('NETWORK_REQUEST_FINISHED');
+  });
+
+  it('settles an unmocked failure exactly once', async () => {
+    window.fetch = (async () => {
+      throw new TypeError('offline');
+    }) as unknown as typeof window.fetch;
+    const posted = vi.spyOn(window, 'postMessage');
+
+    handle = installInterceptor(window);
+    setMode('REPLAY', [mock]);
+
+    await expect(window.fetch('https://example.com/unmocked')).rejects.toThrow('offline');
+
+    const actions = posted.mock.calls.map(([m]) => (m as { action?: string })?.action);
+    expect(actions.filter((a) => a === 'NETWORK_REQUEST_FAILED')).toHaveLength(1);
+    // A FAILED followed by a FINISHED would decrement the pending count twice.
+    expect(actions).not.toContain('NETWORK_REQUEST_FINISHED');
+  });
+
+  it('settles a served mock exactly once', async () => {
+    window.fetch = (async () => new Response('live')) as unknown as typeof window.fetch;
+    const posted = vi.spyOn(window, 'postMessage');
+
+    handle = installInterceptor(window);
+    setMode('REPLAY', [mock]);
+    await window.fetch('https://example.com/api/items');
+
+    const actions = posted.mock.calls.map(([m]) => (m as { action?: string })?.action);
+    expect(actions.filter((a) => a === 'NETWORK_REQUEST_STARTED')).toHaveLength(1);
+    expect(actions.filter((a) => a === 'NETWORK_REQUEST_FINISHED')).toHaveLength(1);
+  });
+
   it('does not throw building a mock for a null-body status', async () => {
     window.fetch = (async () => new Response('live')) as unknown as typeof window.fetch;
     handle = installInterceptor(window);
