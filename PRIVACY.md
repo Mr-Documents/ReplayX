@@ -12,7 +12,12 @@ ReplayX is a deterministic web replay and debug Chrome extension that records us
    - Network requests (URLs, method, headers, and response status)
    - Page navigation events
    - Initial browser state (localStorage, sessionStorage, viewport size)
+   - Non-HttpOnly cookies readable via `document.cookie` at the moment recording
+     starts, stored as part of the session's initial state
    - User agent string
+
+   HttpOnly cookies are not readable by any extension content script and are
+   never captured.
 
 2. **Local Storage**: All recorded sessions are stored locally in your browser's IndexedDB. No data is sent to external servers.
 
@@ -20,11 +25,23 @@ ReplayX is a deterministic web replay and debug Chrome extension that records us
 
 ReplayX automatically sanitizes sensitive data:
 
-- **Password fields**: Values are masked as `********`
-- **Credit card fields**: Fields with names containing "card" are masked
-- **Authorization headers**: Headers like `Authorization`, `Cookie`, `Set-Cookie`, `X-API-Key`, and other authentication tokens are removed
-- **Sensitive query parameters**: Parameters like `token`, `apikey`, `sessionid`, `auth`, `password` are masked in URLs
-- **Request/Response bodies**: Sensitive keys in JSON payloads (password, token, secret, apikey, etc.) are masked
+- **Password fields**: Values are masked as `********` before they leave the page
+- **Credential-shaped fields**: Inputs whose `name` or `id` matches patterns such
+  as pass, card, cvv, ssn, secret, token, pin, otp, iban, or account are masked,
+  as is anything with `autocomplete="current-password"`/`cc-*`/`one-time-code`
+- **Opt-in masking**: Add `data-replay-mask` to any element to force masking
+- **Masking covers both `input` and `change` events**, so a value redacted while
+  typing cannot reappear when the field is committed
+- **Authorization headers**: `Authorization`, `Cookie`, `Set-Cookie`, `X-API-Key`
+  and similar authentication headers are dropped, never stored
+- **Sensitive query parameters**: `token`, `apikey`, `sessionid`, `auth`,
+  `password`, `code`, `signature` and similar are masked in URLs on import
+- **Request/response bodies**: Credential-shaped keys are masked in both JSON and
+  `application/x-www-form-urlencoded` bodies
+- **Body size**: Request and response bodies are truncated at 128KB
+
+Masking is best-effort pattern matching, not a guarantee. Review a session before
+sharing it, and prefer `data-replay-mask` for anything you know is sensitive.
 
 ### Data Retention
 
@@ -37,7 +54,12 @@ ReplayX automatically sanitizes sensitive data:
 
 - **No external data transmission**: ReplayX does not send any recorded data to external servers
 - **Export functionality**: When you export a session, the data is saved to your local machine as a JSON file. You are responsible for the security of exported files
-- **Import functionality**: When you import a session, the data is validated and sanitized before being stored
+- **Import functionality**: Imported sessions are validated against a schema and
+  sanitised before storage. Captured cookies are **stripped entirely** on import,
+  so replaying a session someone else exported cannot inject their credentials
+  into your browser
+- **Export contents**: An exported session may contain cookies captured at
+  recording time. Treat exported files as sensitive.
 
 ### Third-Party Services
 
@@ -54,11 +76,16 @@ You have the right to:
 
 ### Security Measures
 
-- Content Security Policy (CSP) is enforced to prevent XSS attacks
-- Host permissions are restricted to `http://*/*` and `https://*/*`
+- A restrictive Content Security Policy is enforced on extension pages
+  (`script-src 'self'; object-src 'self'; connect-src 'self';`)
+- The popup renders all session-derived content as text, never as HTML, so
+  recorded page content cannot execute in the extension's privileged context
+- Messages arriving over the page-visible `window.postMessage` bridge are
+  origin-checked and shape-validated before being trusted
+- Host permissions are restricted to `http://*/*` and `https://*/*`; no
+  `<all_urls>` and no `downloads` permission
 - All imported session data is validated against a schema
-- Sensitive data is automatically sanitized during recording
-- TypeScript strict mode is enabled for type safety
+- TypeScript strict mode and an enforced lint/coverage gate in CI
 
 ### Changes to This Policy
 
@@ -70,5 +97,5 @@ For questions about this privacy policy or to report security issues, please ref
 
 ---
 
-**Last Updated**: January 2026
-**Version**: 1.0
+**Last Updated**: August 2026
+**Version**: 1.0.0

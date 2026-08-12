@@ -1,304 +1,271 @@
-import { Recorder } from './recorder';
+/**
+ * Isolated-world content script: owns the recorder, the replayer, the on-page
+ * status widget, and the bridge from the MAIN-world interceptor.
+ */
+import { isNetworkCapture } from '../messages';
+import type { ContentRequest, StopRecordResponse } from '../messages';
+import type { RecordedEvent, SessionData } from '../types';
+import { generateId, Recorder } from './recorder';
 import { Replayer } from './replayer';
-import { SessionData } from '../types';
+import { REPLAYX_UI_ATTR } from './selector';
 
 const recorder = new Recorder();
 const replayer = new Replayer();
 
-// Sync widget state when replay finishes naturally
-replayer.onStop = () => updateWidgetState(false);
+replayer.onStop = () => setWidgetState('idle');
 
-// Create floating widget
+// ---------------------------------------------------------------------------
+// Status widget
+// ---------------------------------------------------------------------------
+
+type WidgetState = 'idle' | 'recording' | 'replaying';
+
+const WIDGET_STYLES: Record<WidgetState, { color: string; title: string }> = {
+  idle: { color: '#a0aec0', title: 'ReplayX - Idle' },
+  recording: { color: '#e53e3e', title: 'ReplayX - Recording' },
+  replaying: { color: '#38a169', title: 'ReplayX - Replaying' },
+};
+
 let widget: HTMLDivElement | null = null;
+let widgetDot: HTMLDivElement | null = null;
 
-function createWidget() {
-  // Guard: Ensure body exists and widget isn't already there
-  if (widget || !document.body) return;
+function ensureWidget(): void {
+  if (widget?.isConnected || !document.body) return;
 
   widget = document.createElement('div');
-  widget.id = 'replayx-widget';
-  widget.style.position = 'fixed';
-  widget.style.bottom = '20px';
-  widget.style.right = '20px';
-  widget.style.width = '48px';
-  widget.style.height = '48px';
-  widget.style.borderRadius = '24px';
-  widget.style.backgroundColor = '#1a202c';
-  widget.style.boxShadow = '0 4px 6px rgba(0, 0, 0, 0.3)';
-  widget.style.zIndex = '999999';
-  widget.style.display = 'flex';
-  widget.style.alignItems = 'center';
-  widget.style.justifyContent = 'center';
-  widget.style.cursor = 'pointer';
-  widget.style.transition = 'all 0.2s';
-  widget.title = 'ReplayX - Idle';
-
-  const icon = document.createElement('div');
-  icon.id = 'replayx-icon-dot';
-  icon.style.width = '16px';
-  icon.style.height = '16px';
-  icon.style.borderRadius = '8px';
-  icon.style.backgroundColor = '#a0aec0'; // Idle color
-  widget.appendChild(icon);
-
-  document.body.appendChild(widget);
-
-  widget.addEventListener('click', () => {
-    // Optional: could toggle recording from here, or just open popup.
+  // Tagged so the recorder, the replayer's stability observer, and the DOM
+  // fingerprint all ignore our own UI.
+  widget.setAttribute(REPLAYX_UI_ATTR, 'widget');
+  Object.assign(widget.style, {
+    position: 'fixed',
+    bottom: '20px',
+    right: '20px',
+    width: '48px',
+    height: '48px',
+    borderRadius: '24px',
+    backgroundColor: '#1a202c',
+    boxShadow: '0 4px 6px rgba(0, 0, 0, 0.3)',
+    zIndex: '2147483646',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    pointerEvents: 'none',
+    transition: 'all 0.2s',
   });
+
+  widgetDot = document.createElement('div');
+  widgetDot.setAttribute(REPLAYX_UI_ATTR, 'dot');
+  Object.assign(widgetDot.style, {
+    width: '16px',
+    height: '16px',
+    borderRadius: '8px',
+    backgroundColor: WIDGET_STYLES.idle.color,
+  });
+
+  widget.appendChild(widgetDot);
+  document.body.appendChild(widget);
 }
 
-function updateWidgetState(isRecording: boolean, isReplaying: boolean = false) {
-  if (!widget) createWidget();
-  const icon = document.getElementById('replayx-icon-dot');
-  if (icon && widget) {
-    if (isReplaying) {
-      icon.style.backgroundColor = '#38a169'; // Green for replaying
-      icon.style.boxShadow = '0 0 8px #38a169';
-      widget.title = 'ReplayX - Replaying';
-      widget.style.border = '2px solid #38a169';
-    } else if (isRecording) {
-      icon.style.backgroundColor = '#e53e3e'; // Red for recording
-      icon.style.boxShadow = '0 0 8px #e53e3e';
-      widget.title = 'ReplayX - Recording';
-      widget.style.border = '2px solid #e53e3e';
-    } else {
-      icon.style.backgroundColor = '#a0aec0';
-      icon.style.boxShadow = 'none';
-      widget.title = 'ReplayX - Idle';
-      widget.style.border = 'none';
-    }
+function setWidgetState(state: WidgetState): void {
+  ensureWidget();
+  if (!widget || !widgetDot) return;
+  const style = WIDGET_STYLES[state];
+  widgetDot.style.backgroundColor = style.color;
+  widgetDot.style.boxShadow = state === 'idle' ? 'none' : `0 0 8px ${style.color}`;
+  widget.style.border = state === 'idle' ? 'none' : `2px solid ${style.color}`;
+  widget.title = style.title;
+}
+
+// ---------------------------------------------------------------------------
+// Startup: resume whatever the background says is in flight
+// ---------------------------------------------------------------------------
+
+function bootstrap(): void {
+  ensureWidget();
+  try {
+    chrome.runtime.sendMessage({ action: 'GET_STATE' }, (state) => {
+      if (chrome.runtime.lastError) {
+        console.warn('[ReplayX] Background unavailable:', chrome.runtime.lastError.message);
+        return;
+      }
+      if (!state) return;
+
+      if (state.isRecording && state.currentSessionId) {
+        recorder.start(state.currentSessionId, state.recordingStartTime ?? undefined);
+        if (state.isPaused) recorder.pause();
+        setWidgetState('recording');
+        return;
+      }
+
+      if (state.isReplaying && state.activeReplaySession && !replayer.isActive()) {
+        startReplay(state.activeReplaySession, state.replaySpeed, true, state.replayProgressIndex ?? 0);
+        if (state.isReplayPaused) replayer.pause();
+        return;
+      }
+
+      setWidgetState('idle');
+    });
+  } catch (error) {
+    console.warn('[ReplayX] Bootstrap failed:', error);
   }
 }
 
-// Inject immediately at document_start (via manifest) to catch early API calls
-injectInterceptor();
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', bootstrap, { once: true });
+} else {
+  bootstrap();
+}
+
+function startReplay(session: SessionData, speed: number, isResume: boolean, resumeIndex: number): void {
+  setWidgetState('replaying');
+  void replayer.start(session, { speed: speed || 1, isResume, resumeIndex });
+}
+
+// ---------------------------------------------------------------------------
+// Message handling
+// ---------------------------------------------------------------------------
 
 /**
- * Injects the interceptor into the Main World.
- * Content scripts in Isolated Worlds cannot patch window.fetch.
+ * A single listener for every action. Two listeners were registered before, and
+ * because the first one answered `Unknown action` for anything it did not
+ * recognise, STEP_REPLAY was always rejected before the second could reply.
  */
-function injectInterceptor() {
-  const script = document.createElement('script');
-  script.src = chrome.runtime.getURL('dist/content/interceptor.js');
-  script.onload = () => script.remove();
-  (document.head || document.documentElement).appendChild(script);
-}
-
-// Check initial state from background in case of page refresh or navigation
-chrome.runtime.sendMessage({ action: 'GET_STATE' }, (state: any) => {
-  if (chrome.runtime.lastError) {
-    console.warn('[ReplayX] Could not connect to background script:', chrome.runtime.lastError.message);
-    return;
-  }
-
-  createWidget();
-
-  if (state?.isRecording && state?.currentSessionId) {
-    console.log('[ReplayX] Resuming recording after navigation or refresh');
-    recorder.start(state.currentSessionId, state.recordingStartTime);
-    if (state.isPaused) recorder.pause();
-    updateWidgetState(true);
-  } else if (state?.activeReplaySession && !replayer.isActive()) {
-    console.log('[ReplayX] Automatically resuming replay after navigation');
-    startReplaySession(state.activeReplaySession, state.replaySpeed, true, state.replayProgressIndex || 0);
-    if (state.isReplayPaused) replayer.pause();
-  } else {
-    updateWidgetState(false);
-  }
-});
-
-// Message handlers
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  // Return true to keep message channel open for async responses
-  switch (message.action) {
-    case 'START_RECORD':
-      try {
-        recorder.start(message.sessionId);
-        updateWidgetState(true);
-        const startTime = recorder.getSessionStartTime();
-        sendResponse({
-          success: true,
-          url: window.location.href,
-          startTime
-        });
-      } catch (error) {
-        console.error('[ReplayX] Error starting recording:', error);
-        sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
-      }
-      break;
+  const request = message as ContentRequest;
+  if (!request || typeof request.action !== 'string') return false;
 
-    case 'STOP_RECORD':
-      try {
+  try {
+    switch (request.action) {
+      case 'START_RECORD':
+        recorder.start(request.sessionId, request.sessionStartTime);
+        setWidgetState('recording');
+        sendResponse({ success: true, url: window.location.href, startTime: recorder.getSessionStartTime() });
+        return false;
+
+      case 'STOP_RECORD': {
         const result = recorder.stop();
-        updateWidgetState(false);
-        sendResponse({
-          success: true,
+        setWidgetState('idle');
+        const payload: StopRecordResponse = {
           events: result.events,
           startTime: result.startTime,
           initialState: result.initialState,
           url: window.location.href,
-          viewport: { width: window.innerWidth, height: window.innerHeight }
-        });
-      } catch (error) {
-        console.error('[ReplayX] Error stopping recording:', error);
-        sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
+          viewport: { width: window.innerWidth, height: window.innerHeight },
+        };
+        sendResponse({ success: true, data: payload, ...payload });
+        return false;
       }
-      break;
 
-    case 'PAUSE_RECORDING':
-      try {
+      case 'PAUSE_RECORDING':
         recorder.pause();
         sendResponse({ success: true });
-      } catch (error) {
-        sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
-      }
-      break;
+        return false;
 
-    case 'RESUME_RECORDING':
-      try {
+      case 'RESUME_RECORDING':
         recorder.resume();
         sendResponse({ success: true });
-      } catch (error) {
-        sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
-      }
-      break;
+        return false;
 
-    case 'START_REPLAY':
-      try {
-        // allow resumeIndex when starting replay from a specific event
-        startReplaySession(message.session, message.speed, false, message.resumeIndex || 0);
+      case 'START_REPLAY':
+        startReplay(request.session, request.speed, false, request.resumeIndex ?? 0);
         sendResponse({ success: true });
-      } catch (error) {
-        console.error('[ReplayX] Error starting replay:', error);
-        updateWidgetState(false);
-        sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
-      }
-      break;
+        return false;
 
-    case 'STOP_REPLAY':
-      try {
-        replayer.stop();
-        updateWidgetState(false);
+      case 'STOP_REPLAY':
+        replayer.stop(false);
+        setWidgetState('idle');
         sendResponse({ success: true });
-      } catch (error) {
-        console.error('[ReplayX] Error stopping replay:', error);
-        sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
-      }
-      break;
+        return false;
 
-    case 'PAUSE_REPLAY':
-      try {
+      case 'PAUSE_REPLAY':
         replayer.pause();
         sendResponse({ success: true });
-      } catch (error) {
-        sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
-      }
-      break;
+        return false;
 
-    case 'RESUME_REPLAY':
-      try {
+      case 'RESUME_REPLAY':
         replayer.resume();
         sendResponse({ success: true });
-      } catch (error) {
-        sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
-      }
-      break;
+        return false;
 
-    case 'SET_REPLAY_SPEED':
-      try {
-        replayer.setSpeed(message.speed);
+      case 'SET_REPLAY_SPEED':
+        replayer.setSpeed(request.speed);
         sendResponse({ success: true });
-      } catch (error) {
-        console.error('[ReplayX] Error setting replay speed:', error);
-        sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
-      }
-      break;
+        return false;
 
-    default:
-      sendResponse({ success: false, error: 'Unknown action' });
-  }
-  return true;
-});
+      case 'STEP_REPLAY':
+        void replayer.step();
+        sendResponse({ success: true });
+        return false;
 
-// Support stepping the replay from background
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse): boolean => {
-  if (message.action === 'STEP_REPLAY') {
-    try {
-      replayer.step();
-      sendResponse({ success: true });
-    } catch (e) {
-      sendResponse({ success: false, error: e instanceof Error ? e.message : String(e) });
+      default:
+        sendResponse({ success: false, error: 'Unknown action' });
+        return false;
     }
-    return true;
+  } catch (error) {
+    console.error(`[ReplayX] ${request.action} failed:`, error);
+    sendResponse({ success: false, error: error instanceof Error ? error.message : String(error) });
+    return false;
   }
-  return false;
 });
 
-/**
- * Shared helper to start replay and update UI
- */
-function startReplaySession(session: SessionData, speed: number, isResume: boolean = false, resumeIndex: number = 0) {
-  updateWidgetState(false, true);
-  replayer.start(session, { speed: speed || 1, isResume, resumeIndex });
-}
+// ---------------------------------------------------------------------------
+// Interceptor bridge
+// ---------------------------------------------------------------------------
 
-// Handle network events from interceptor
 window.addEventListener('message', (event) => {
-  if (event.data && event.data.source === 'replayx-interceptor' && event.data.type === 'Network') {
-    // Forward network events to recorder
-    recorder.addEvent({
-      id: (function() {
-        if (typeof crypto !== 'undefined' && crypto.randomUUID) {
-          return crypto.randomUUID();
-        }
-        return Math.random().toString(36).substring(2);
-      })(),
-      sessionId: recorder.getSessionId() || 'unknown',
-      type: 'Network',
-      timestamp: event.data.timestamp,
-      payload: {
-        method: event.data.method,
-        url: event.data.url,
-        requestHeaders: event.data.requestHeaders,
-        requestBody: event.data.requestBody,
-        responseStatus: event.data.responseStatus,
-        responseHeaders: event.data.responseHeaders,
-        responseBody: event.data.responseBody
-      }
-    });
-  }
+  // Only same-window messages are trusted; anything else is page-controlled.
+  if (event.source !== window) return;
+  if (!isNetworkCapture(event.data)) return;
+  if (!recorder.isRecordingActive()) return;
+
+  const capture = event.data;
+  recorder.addEvent({
+    id: generateId(),
+    sessionId: recorder.getSessionId(),
+    // The interceptor reports absolute wall-clock time; every other event is
+    // relative to session start. Without this normalisation network events were
+    // scheduled millions of milliseconds into the future and never replayed.
+    timestamp: Math.max(0, capture.timestamp - recorder.getSessionStartTime()),
+    type: 'Network',
+    payload: {
+      method: capture.method,
+      url: capture.url,
+      requestHeaders: capture.requestHeaders,
+      requestBody: capture.requestBody,
+      responseStatus: capture.responseStatus,
+      responseHeaders: capture.responseHeaders,
+      responseBody: capture.responseBody,
+      duration: capture.duration,
+      truncated: capture.truncated,
+    },
+  } as RecordedEvent);
 });
 
-// Error handling
-window.addEventListener('error', (event) => {
-  console.error('[ReplayX] Content script error:', event.error);
-});
+// ---------------------------------------------------------------------------
+// Teardown
+// ---------------------------------------------------------------------------
 
-window.addEventListener('unhandledrejection', (event) => {
-  console.error('[ReplayX] Unhandled promise rejection:', event.reason);
-});
+let flushed = false;
 
-// Cleanup on page unload
-function flushRecordingState() {
-  if (!recorder.isRecordingActive()) {
-    return;
-  }
+/** Hands the tail of the buffer to the background before the page goes away. */
+function flushBeforeUnload(): void {
+  if (flushed || !recorder.isRecordingActive()) return;
+  flushed = true;
 
   const sessionId = recorder.getSessionId();
-  const sessionStartTime = recorder.getSessionStartTime();
-  const result = recorder.stop();
+  const events = recorder.flushEvents();
+  if (!sessionId || events.length === 0) return;
 
-  if (sessionId && result.events.length) {
-    chrome.runtime.sendMessage({
-      action: 'SAVE_RECORDING_EVENTS',
-      sessionId,
-      events: result.events,
-      sessionStartTime,
-      initialState: result.initialState
+  try {
+    chrome.runtime.sendMessage({ action: 'SAVE_RECORDING_EVENTS', sessionId, events }, () => {
+      void chrome.runtime.lastError;
     });
+  } catch {
+    /* the extension context may already be gone */
   }
 }
 
-window.addEventListener('pagehide', flushRecordingState);
-window.addEventListener('beforeunload', flushRecordingState);
+// `pagehide` fires in cases `beforeunload` does not (bfcache, mobile); both are
+// registered but the guard makes the flush idempotent.
+window.addEventListener('pagehide', flushBeforeUnload);
+window.addEventListener('beforeunload', flushBeforeUnload);

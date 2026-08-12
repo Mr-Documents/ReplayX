@@ -4,9 +4,9 @@ This guide covers building, testing, and deploying the ReplayX Chrome extension 
 
 ## Prerequisites
 
-- Node.js (v18 or higher)
-- npm or yarn
-- Chrome or Chromium browser for testing
+- Node.js 20.19 or higher (see `.nvmrc`; the toolchain requires it)
+- npm
+- Chrome or Chromium 116+ for testing
 - Chrome Web Store Developer Account (for publishing)
 
 ## Development Setup
@@ -43,9 +43,13 @@ This guide covers building, testing, and deploying the ReplayX Chrome extension 
    - All assets are minified and optimized
 
 3. **Verify Build**
-   - Check that `dist/manifest.json` exists and is valid
-   - Ensure `dist/service_worker.js` is present (not `.ts`)
-   - Verify all content scripts are compiled to JavaScript
+   - `dist/manifest.json` exists, is Manifest V3, and lists a `background.service_worker`
+   - The bundler rewrites `manifest.json` paths to hashed filenames; the built
+     manifest must not still reference any `.ts` file
+   - Exactly one content script entry declares `"world": "MAIN"` (the interceptor)
+   - `dist/favicon.svg` exists, since the manifest icons resolve to it
+
+   CI performs these checks automatically; see `.github/workflows/ci.yml`.
 
 ## Testing Before Deployment
 
@@ -64,14 +68,17 @@ This guide covers building, testing, and deploying the ReplayX Chrome extension 
 
 ### Automated Testing
 
-Run the test suite:
 ```bash
-npm run test
+npm run verify   # typecheck + lint + tests with coverage + production build
 ```
 
-Run tests with coverage:
+Individual steps:
+
 ```bash
-npm run test:coverage
+npm run typecheck
+npm run lint
+npm run test:run
+npm run test:coverage   # fails the build if coverage regresses below threshold
 ```
 
 ## Security Verification
@@ -81,26 +88,35 @@ Before deployment, verify:
 1. **Manifest Permissions**
    - Host permissions are restricted to `http://*/*` and `https://*/*`
    - No `<all_urls>` permission
-   - Content Security Policy is configured
+   - No `downloads` permission: export builds the file in the popup instead
+   - `extension_pages` CSP is `script-src 'self'; object-src 'self'; connect-src 'self';`
+     (the popup makes no outbound requests, so `connect-src` stays closed)
 
 2. **Data Sanitization**
-   - Password fields are masked
-   - Authorization headers are removed
-   - Sensitive query parameters are masked
-   - Import validation is enabled
+   - Password and credential-shaped fields are masked at capture time, on both
+     `input` and `change`
+   - Authorization-style headers are dropped by the interceptor
+   - Credential-shaped JSON and form-encoded body fields are masked
+   - Sensitive query parameters are masked on import
+   - Imported sessions have `initialState.cookies` and `metadata.cookiesCaptured`
+     stripped before storage
 
-3. **Type Safety**
-   - TypeScript strict mode is enabled
-   - No TypeScript compilation errors
-   - All unused variables are removed
+3. **Extension-page XSS**
+   - The popup renders every recorded value with `createElement` + `textContent`.
+     Any change that introduces `innerHTML` on session-derived data is a
+     security regression: recorded page text is attacker-controlled.
+
+4. **Type Safety**
+   - TypeScript strict mode, `noUncheckedIndexedAccess`, and `noImplicitReturns`
+   - `npm run typecheck` and `npm run lint` both clean
 
 ## Chrome Web Store Submission
 
 ### Preparation
 
 1. **Update Version**
-   - Increment version in `manifest.json`
-   - Update version in `package.json`
+   - Increment `version` in `manifest.json`
+   - Keep `version` in `package.json` in sync
 
 2. **Package Extension**
    - Build production version: `npm run build`
@@ -159,14 +175,21 @@ When releasing updates:
 ### Build Issues
 
 **Problem**: TypeScript compilation errors
-- **Solution**: Run `npm run type-check` to identify issues
-- Ensure all dependencies are installed
-- Check TypeScript configuration in `tsconfig.json`
+- **Solution**: Run `npm run typecheck` to identify issues
+- Ensure dependencies are installed and Node is 20.19+
+
+**Problem**: `Cannot find native binding` from the bundler
+- **Solution**: npm's optional-dependency bug. Remove `node_modules` and run
+  `npm install` again with the Node version from `.nvmrc`
 
 **Problem**: Service worker not loading
-- **Solution**: Verify `service_worker.js` exists in `dist`
-- Check manifest.json references the correct file
-- Ensure service worker is configured as a module
+- **Solution**: Confirm `dist/service-worker-loader.js` exists and that
+  `dist/manifest.json` points at it with `"type": "module"`
+
+**Problem**: Recording state lost after leaving the popup open a while
+- **Solution**: Expected only if state is being held in worker memory. State
+  belongs in `chrome.storage.session` (`src/background/state.ts`) and flushed
+  events go straight to IndexedDB
 
 ### Runtime Issues
 
@@ -180,34 +203,22 @@ When releasing updates:
 - Check for DOM mismatches
 - Review replay error logs
 
-## Continuous Deployment (Optional)
+## Continuous Integration
 
-For automated deployments, consider setting up:
+Automated builds on release tags and Chrome Web Store upload via the
+`chrome-webstore-upload` API remain a future addition.
 
-1. **GitHub Actions** for CI/CD
-2. **Automated testing** on push
-3. **Automated builds** on release tags
-4. **Version management** using semantic versioning
+CI is already configured in [.github/workflows/ci.yml](.github/workflows/ci.yml).
+On every push and pull request to `main` it runs, across Node 20.19 / 22 / 24:
 
-Example GitHub Actions workflow:
+- `npm run typecheck`
+- `npm run lint`
+- `npm run test:coverage` (coverage thresholds enforced)
+- `npx vite build`, followed by a structural validation of `dist/manifest.json`
 
-```yaml
-name: Build and Test
-
-on: [push, pull_request]
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
-        with:
-          node-version: '18'
-      - run: npm install
-      - run: npm run build
-      - run: npm run test
-```
+A separate job runs `npm audit --audit-level=high`. Coverage and the built
+extension are uploaded as artefacts, so a release candidate can be downloaded
+straight from the workflow run.
 
 ## Support and Maintenance
 
@@ -226,5 +237,5 @@ jobs:
 
 ---
 
-**Last Updated**: January 2026
-**Version**: 1.0
+**Last Updated**: August 2026
+**Version**: 1.0.0

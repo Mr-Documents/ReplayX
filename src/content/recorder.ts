@@ -1,588 +1,488 @@
-import {
+import { CONTENT_SOURCE, type InterceptorMode } from '../messages';
+import type {
+  InitialStateSnapshot,
+  MutationPayload,
   RecordedEvent,
   TargetPayload,
-  MutationEvent
 } from '../types';
+import { buildTargetPayload, getRobustSelector, isReplayXNode } from './selector';
+
+export interface RecorderLimits {
+  maxEvents: number;
+  maxSessionBytes: number;
+  flushThreshold: number;
+  maxMutationHtml: number;
+  maxMutationsPerSecond: number;
+}
+
+export const DEFAULT_LIMITS: RecorderLimits = {
+  maxEvents: 50_000,
+  maxSessionBytes: 50 * 1024 * 1024,
+  flushThreshold: 1_000,
+  /** Serialised node HTML above this is truncated; full DOM dumps were the single largest payload source. */
+  maxMutationHtml: 4_096,
+  /** A hard ceiling on mutation events: animation loops can emit thousands per second. */
+  maxMutationsPerSecond: 120,
+};
+
+const SCROLL_DEBOUNCE_MS = 120;
+const INPUT_DEBOUNCE_MS = 50;
+
+const SENSITIVE_NAME = /pass|card|cvv|cvc|ssn|secret|token|pin|otp|iban|account|security|credential/i;
+
+export interface StopResult {
+  events: RecordedEvent[];
+  startTime: number;
+  initialState: InitialStateSnapshot | null;
+}
 
 export class Recorder {
   private events: RecordedEvent[] = [];
-  private sessionId: string = '';
-  private sequenceCounter: number = 0;
-  private sessionStartTime: number = 0;
-  private isRecording = false;
-  private isPaused = false;
+  private sessionId = '';
+  private sequenceCounter = 0;
+  private sessionStartTime = 0;
+  private recording = false;
+  private paused = false;
   private historyLength = 0;
-  private initialState: any = null;
+  private initialState: InitialStateSnapshot | null = null;
   private mutationObserver: MutationObserver | null = null;
-  private scrollTimeout: number | null = null;
-  
-  // Memory management limits
-  private readonly MAX_EVENTS = 50000; // Maximum events per session
-  private readonly MAX_SESSION_SIZE = 50 * 1024 * 1024; // 50MB max session size
-  private readonly FLUSH_THRESHOLD = 1000; // Flush events to background every 1000 events
-  private currentSessionSize = 0;
 
-  // Rate limiting
-  private readonly SCROLL_DEBOUNCE_MS = 100;
-  private readonly INPUT_DEBOUNCE_MS = 50;
-  private lastScrollTime = 0;
-  private lastInputTime = 0;
+  private scrollTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingScroll: { target: Element | Window; selector: string } | null = null;
+  private lastInputAt = 0;
 
-  // Event handlers
-  private boundClickHandler = this.onClick.bind(this);
-  private boundDblClickHandler = this.onDblClick.bind(this);
-  private boundInputHandler = this.onInput.bind(this);
-  private boundChangeHandler = this.onChange.bind(this);
-  private boundSubmitHandler = this.onSubmit.bind(this);
-  private boundScrollHandler = this.onScroll.bind(this);
-  private boundResizeHandler = this.onResize.bind(this);
-  private boundFocusHandler = this.onFocus.bind(this);
-  private boundBlurHandler = this.onBlur.bind(this);
-  private boundKeyDownHandler = this.onKeyDown.bind(this);
-  private boundKeyUpHandler = this.onKeyUp.bind(this);
-  private boundNavigationHandler = this.onNavigation.bind(this);
+  private approxSessionBytes = 0;
+  private mutationWindowStart = 0;
+  private mutationsInWindow = 0;
+  private limitReached = false;
 
-  start(sessionId: string, sessionStartTime?: number) {
-    if (this.isRecording) return;
-    this.isRecording = true;
-    this.isPaused = false;
+  private originalPushState: History['pushState'] | null = null;
+  private originalReplaceState: History['replaceState'] | null = null;
+
+  private readonly limits: RecorderLimits;
+
+  private readonly onClickBound = (e: Event) => this.onClick(e as MouseEvent, false);
+  private readonly onDblClickBound = (e: Event) => this.onClick(e as MouseEvent, true);
+  private readonly onInputBound = (e: Event) => this.onInput(e);
+  private readonly onChangeBound = (e: Event) => this.onChange(e);
+  private readonly onSubmitBound = (e: Event) => this.onSubmit(e);
+  private readonly onScrollBound = (e: Event) => this.onScroll(e);
+  private readonly onResizeBound = () => this.onResize();
+  private readonly onFocusBound = (e: Event) => this.onFocusChange(e, 'Focus');
+  private readonly onBlurBound = (e: Event) => this.onFocusChange(e, 'Blur');
+  private readonly onKeyDownBound = (e: Event) => this.onKey(e as KeyboardEvent, 'down');
+  private readonly onKeyUpBound = (e: Event) => this.onKey(e as KeyboardEvent, 'up');
+  private readonly onNavigationBound = (e: Event) => this.onNavigation(e);
+
+  constructor(limits: Partial<RecorderLimits> = {}) {
+    this.limits = { ...DEFAULT_LIMITS, ...limits };
+  }
+
+  start(sessionId: string, sessionStartTime?: number): void {
+    if (this.recording) return;
+    this.recording = true;
+    this.paused = false;
+    this.limitReached = false;
     this.sessionId = sessionId;
     this.events = [];
+    this.sequenceCounter = 0;
+    this.approxSessionBytes = 0;
     this.sessionStartTime = sessionStartTime ?? Date.now();
     this.historyLength = window.history.length;
 
-    // MVP Improvement: Capture initial state correctly using helper
     this.initialState = {
-      localStorage: this.captureStorage(localStorage),
-      sessionStorage: this.captureStorage(sessionStorage),
       url: window.location.href,
       viewport: { width: window.innerWidth, height: window.innerHeight },
-      cookies: document.cookie
+      localStorage: this.captureStorage(() => localStorage),
+      sessionStorage: this.captureStorage(() => sessionStorage),
+      cookies: this.safeCookies(),
     };
-    console.log('[ReplayX Recorder] Captured initial state');
 
-    // Add event listeners
-    document.addEventListener('click', this.boundClickHandler, true);
-    document.addEventListener('dblclick', this.boundDblClickHandler, true);
-    document.addEventListener('input', this.boundInputHandler, true);
-    document.addEventListener('change', this.boundChangeHandler, true);
-    document.addEventListener('submit', this.boundSubmitHandler, true);
-    document.addEventListener('scroll', this.boundScrollHandler, true);
-    window.addEventListener('resize', this.boundResizeHandler);
-    document.addEventListener('focus', this.boundFocusHandler, true);
-    document.addEventListener('blur', this.boundBlurHandler, true);
-    document.addEventListener('keydown', this.boundKeyDownHandler, true);
-    document.addEventListener('keyup', this.boundKeyUpHandler, true);
+    document.addEventListener('click', this.onClickBound, true);
+    document.addEventListener('dblclick', this.onDblClickBound, true);
+    document.addEventListener('input', this.onInputBound, true);
+    document.addEventListener('change', this.onChangeBound, true);
+    document.addEventListener('submit', this.onSubmitBound, true);
+    document.addEventListener('scroll', this.onScrollBound, true);
+    document.addEventListener('focus', this.onFocusBound, true);
+    document.addEventListener('blur', this.onBlurBound, true);
+    document.addEventListener('keydown', this.onKeyDownBound, true);
+    document.addEventListener('keyup', this.onKeyUpBound, true);
+    window.addEventListener('resize', this.onResizeBound);
 
-    // Navigation events
     this.setupNavigationTracking();
-
-    // If resuming after a reload, record the current location immediately
-    if (sessionStartTime) {
-      this.onNavigation();
-    }
-
-    // Mutation observer for DOM changes
     this.setupMutationObserver();
 
-    console.log('[ReplayX Recorder] Started recording session:', sessionId);
+    // Without this the MAIN-world interceptor stays IDLE and no network event
+    // is ever captured - network recording was entirely inert before.
+    this.setInterceptorMode('RECORD');
+
+    if (sessionStartTime) this.onNavigation();
+
+    console.info('[ReplayX Recorder] Recording session', sessionId);
   }
 
-  stop(): { events: RecordedEvent[], startTime: number, initialState: any } {
-    if (!this.isRecording) return { events: [], startTime: 0, initialState: null };
+  stop(): StopResult {
+    if (!this.recording) return { events: [], startTime: 0, initialState: null };
+    this.recording = false;
 
-    this.isRecording = false;
+    document.removeEventListener('click', this.onClickBound, true);
+    document.removeEventListener('dblclick', this.onDblClickBound, true);
+    document.removeEventListener('input', this.onInputBound, true);
+    document.removeEventListener('change', this.onChangeBound, true);
+    document.removeEventListener('submit', this.onSubmitBound, true);
+    document.removeEventListener('scroll', this.onScrollBound, true);
+    document.removeEventListener('focus', this.onFocusBound, true);
+    document.removeEventListener('blur', this.onBlurBound, true);
+    document.removeEventListener('keydown', this.onKeyDownBound, true);
+    document.removeEventListener('keyup', this.onKeyUpBound, true);
+    window.removeEventListener('resize', this.onResizeBound);
 
-    // Remove event listeners
-    document.removeEventListener('click', this.boundClickHandler, true);
-    document.removeEventListener('dblclick', this.boundDblClickHandler, true);
-    document.removeEventListener('input', this.boundInputHandler, true);
-    document.removeEventListener('change', this.boundChangeHandler, true);
-    document.removeEventListener('submit', this.boundSubmitHandler, true);
-    document.removeEventListener('scroll', this.boundScrollHandler, true);
-    window.removeEventListener('resize', this.boundResizeHandler);
-    document.removeEventListener('focus', this.boundFocusHandler, true);
-    document.removeEventListener('blur', this.boundBlurHandler, true);
-    document.removeEventListener('keydown', this.boundKeyDownHandler, true);
-    document.removeEventListener('keyup', this.boundKeyUpHandler, true);
     this.cleanupNavigationTracking();
+    this.mutationObserver?.disconnect();
+    this.mutationObserver = null;
 
-    // Disconnect mutation observer
-    if (this.mutationObserver) {
-      this.mutationObserver.disconnect();
-      this.mutationObserver = null;
+    if (this.scrollTimer) {
+      clearTimeout(this.scrollTimer);
+      this.scrollTimer = null;
     }
+    this.pendingScroll = null;
 
-    // Clear scroll timeout
-    if (this.scrollTimeout) {
-      clearTimeout(this.scrollTimeout);
-      this.scrollTimeout = null;
-    }
+    this.setInterceptorMode('IDLE');
 
-    // Flush any remaining events before stopping
-    this.flushEventsToBackground();
-
-    const result = {
+    const result: StopResult = {
       events: this.events,
       startTime: this.sessionStartTime,
-      initialState: this.initialState
+      initialState: this.initialState,
     };
     this.events = [];
     this.initialState = null;
-    this.currentSessionSize = 0;
-    console.log('[ReplayX Recorder] Stopped recording, captured', result.events.length, 'events');
+    this.approxSessionBytes = 0;
+    console.info('[ReplayX Recorder] Stopped; captured', result.events.length, 'events');
     return result;
   }
 
-  pause() {
-    this.isPaused = true;
-    console.log('[ReplayX Recorder] Recording paused');
+  pause(): void {
+    this.paused = true;
   }
 
-  resume() {
-    this.isPaused = false;
-    console.log('[ReplayX Recorder] Recording resumed');
+  resume(): void {
+    this.paused = false;
   }
 
-  public addEvent(event: RecordedEvent) {
-    // Guard 1: Prevent recording events triggered by the replayer
-    if ((window as any)._replayx_is_replaying) return;
+  isRecordingActive(): boolean {
+    return this.recording;
+  }
 
-    if (this.isRecording && !this.isPaused) {
-      // Check memory limits
-      if (this.events.length >= this.MAX_EVENTS) {
-        console.warn('[ReplayX Recorder] Maximum event limit reached, stopping recording');
-        this.stop();
-        return;
-      }
+  isPausedState(): boolean {
+    return this.paused;
+  }
 
-      const eventSize = JSON.stringify(event).length;
-      if (this.currentSessionSize + eventSize > this.MAX_SESSION_SIZE) {
-        console.warn('[ReplayX Recorder] Maximum session size reached, stopping recording');
-        this.stop();
-        return;
-      }
+  getSessionId(): string {
+    return this.sessionId;
+  }
 
-      // assign monotonic sequence number
-      this.sequenceCounter += 1;
-      (event as any).sequence = this.sequenceCounter;
-      // Guard 2: Tag the event with the current frame's URL for deterministic replay
-      event.payload.frameUrl = window.location.href;
-      this.events.push(event);
-      this.currentSessionSize += eventSize;
+  getSessionStartTime(): number {
+    return this.sessionStartTime;
+  }
 
-      // Flush events to background periodically to manage memory
-      if (this.events.length >= this.FLUSH_THRESHOLD) {
-        this.flushEventsToBackground();
-      }
+  addEvent(event: RecordedEvent | null | undefined): void {
+    if (!event || typeof event !== 'object' || !event.type) return;
+    if (!this.recording || this.paused || this.limitReached) return;
+    // Never record what the replayer is driving.
+    if ((window as unknown as Record<string, unknown>)._replayx_is_replaying) return;
+
+    if (this.events.length >= this.limits.maxEvents) {
+      this.onLimitReached('event count');
+      return;
     }
+
+    // A cheap size estimate. `JSON.stringify(event).length` per event (the
+    // previous approach) is O(payload) on the hot path and doubles the cost of
+    // every large mutation record.
+    const estimatedBytes = estimatePayloadBytes(event);
+    if (this.approxSessionBytes + estimatedBytes > this.limits.maxSessionBytes) {
+      this.onLimitReached('session size');
+      return;
+    }
+
+    this.sequenceCounter += 1;
+    event.sequence = this.sequenceCounter;
+    event.payload.frameUrl = window.location.href;
+    this.events.push(event);
+    this.approxSessionBytes += estimatedBytes;
+
+    if (this.events.length >= this.limits.flushThreshold) this.flushEventsToBackground();
   }
 
-  private flushEventsToBackground() {
+  /** Hands buffered events to the background and clears the local buffer. */
+  flushEventsToBackground(): void {
     if (this.events.length === 0) return;
-    
-    const eventsToFlush = this.flushEvents();
-    if (eventsToFlush.length > 0) {
-      chrome.runtime.sendMessage({
-        action: 'SAVE_RECORDING_EVENTS',
-        sessionId: this.sessionId,
-        events: eventsToFlush
-      }, () => {
-        if (chrome.runtime.lastError) {
-          console.warn('[ReplayX Recorder] Failed to flush events:', chrome.runtime.lastError.message);
-        }
-      });
+    const events = this.flushEvents();
+    try {
+      chrome.runtime.sendMessage(
+        { action: 'SAVE_RECORDING_EVENTS', sessionId: this.sessionId, events },
+        () => {
+          if (chrome.runtime.lastError) {
+            console.warn('[ReplayX Recorder] Flush failed:', chrome.runtime.lastError.message);
+          }
+        },
+      );
+    } catch (error) {
+      console.warn('[ReplayX Recorder] Flush threw:', error);
     }
   }
 
-  public flushEvents(): RecordedEvent[] {
+  flushEvents(): RecordedEvent[] {
     const flushed = this.events;
     this.events = [];
     return flushed;
   }
 
-  public isRecordingActive(): boolean {
-    return this.isRecording;
-  }
+  // -------------------------------------------------------------------------
+  // Capture handlers
+  // -------------------------------------------------------------------------
 
-  public getSessionId(): string {
-    return this.sessionId;
-  }
-
-  public getSessionStartTime(): number {
-    return this.sessionStartTime;
-  }
-
-  private getTimestamp(): number {
-    return Date.now() - this.sessionStartTime;
-  }
-
-  private captureStorage(storage: Storage): Record<string, string> {
-    const data: Record<string, string> = {};
-    for (let i = 0; i < storage.length; i++) {
-      const key = storage.key(i);
-      if (key) {
-        data[key] = storage.getItem(key) || '';
-      }
-    }
-    return data;
-  }
-
-  private onClick(e: MouseEvent) {
-    const target = e.target as HTMLElement;
-    const selectorPayload = this.buildTargetPayload(target);
-
+  private onClick(e: MouseEvent, isDouble: boolean): void {
+    const target = this.resolveTarget(e);
+    if (!target) return;
     this.addEvent({
-      id: this.generateId(),
+      id: generateId(),
       sessionId: this.sessionId,
-      timestamp: this.getTimestamp(),
-      type: 'Click',
-      payload: {
-        ...selectorPayload,
-        x: e.clientX,
-        y: e.clientY
-      }
-    });
+      timestamp: this.timestamp(),
+      type: isDouble ? 'DoubleClick' : 'Click',
+      payload: { ...this.target(target), x: e.clientX, y: e.clientY, ...(isDouble ? { dbl: true } : {}) },
+    } as RecordedEvent);
   }
 
-  private onDblClick(e: MouseEvent) {
-    const target = e.target as HTMLElement;
-    const selectorPayload = this.buildTargetPayload(target);
-
-    this.addEvent({
-      id: this.generateId(),
-      sessionId: this.sessionId,
-      timestamp: this.getTimestamp(),
-      type: 'Click',
-      payload: {
-        ...selectorPayload,
-        x: e.clientX,
-        y: e.clientY,
-        dbl: true
-      }
-    });
-  }
-
-  private onInput(e: Event) {
-    // Rate limit input events
+  private onInput(e: Event): void {
     const now = Date.now();
-    if (now - this.lastInputTime < this.INPUT_DEBOUNCE_MS) {
-      return; // Skip this input event if too recent
-    }
-    this.lastInputTime = now;
+    if (now - this.lastInputAt < INPUT_DEBOUNCE_MS) return;
+    this.lastInputAt = now;
 
-    const target = e.target as HTMLElement;
-    const inputTarget = target as HTMLInputElement;
-    const selectorPayload = this.buildTargetPayload(target);
-
-    // Handle specialized input types
-    let value: string;
-    if (inputTarget?.type === 'checkbox' || inputTarget?.type === 'radio') {
-      value = String(inputTarget.checked);
-    } else if (target.hasAttribute('contenteditable')) {
-      value = target.innerText;
-    } else {
-      value = inputTarget?.value || '';
-    }
-
-    // Basic privacy masking
-    let maskedValue = value;
-    const isSensitive = ((target as HTMLInputElement).type === 'password' || 
-                        target.getAttribute('name')?.toLowerCase().includes('card') ||
-                        target.hasAttribute('data-replay-mask')) &&
-                        !['checkbox', 'radio'].includes((target as HTMLInputElement).type);
-    if (isSensitive) maskedValue = '********';
+    const target = this.resolveTarget(e);
+    if (!target) return;
+    const { value, masked } = this.readValue(target);
 
     this.addEvent({
-      id: this.generateId(),
+      id: generateId(),
       sessionId: this.sessionId,
-      timestamp: this.getTimestamp(),
+      timestamp: this.timestamp(),
       type: 'Input',
       payload: {
-        ...selectorPayload,
-        value: maskedValue,
-        inputType: (e as any).inputType || inputTarget?.type || 'unknown'
-      }
-    });
-  }
-
-  private onChange(e: Event) {
-    const target = e.target as HTMLElement;
-    const inputTarget = target as HTMLInputElement;
-    const selectorPayload = this.buildTargetPayload(target);
-
-    let value = '';
-    if (inputTarget?.type === 'checkbox' || inputTarget?.type === 'radio') {
-      value = String(inputTarget.checked);
-    } else if (target.hasAttribute('contenteditable')) {
-      value = target.innerText;
-    } else {
-      value = inputTarget?.value || '';
-    }
-
-    this.addEvent({
-      id: this.generateId(),
-      sessionId: this.sessionId,
-      timestamp: this.getTimestamp(),
-      type: 'Change',
-      payload: {
-        ...selectorPayload,
+        ...this.target(target),
         value,
-        inputType: (e.target as HTMLInputElement)?.type || 'unknown'
-      }
-    });
+        masked,
+        inputType: (e as globalThis.InputEvent).inputType || inputElementType(target) || 'unknown',
+      },
+    } as RecordedEvent);
   }
 
-  private onSubmit(e: Event) {
-    const form = (e.target as HTMLElement).closest('form') as HTMLFormElement | null;
-    if (!form) return;
-    const selectorPayload = this.buildTargetPayload(form);
+  private onChange(e: Event): void {
+    const target = this.resolveTarget(e);
+    if (!target) return;
+    // Change events were previously stored unmasked, leaking password fields
+    // that the Input handler had carefully redacted.
+    const { value, masked } = this.readValue(target);
 
     this.addEvent({
-      id: this.generateId(),
+      id: generateId(),
       sessionId: this.sessionId,
-      timestamp: this.getTimestamp(),
+      timestamp: this.timestamp(),
+      type: 'Change',
+      payload: { ...this.target(target), value, masked, inputType: inputElementType(target) || 'unknown' },
+    } as RecordedEvent);
+  }
+
+  private onSubmit(e: Event): void {
+    const target = this.resolveTarget(e);
+    const form = target?.closest('form') as HTMLFormElement | null;
+    if (!form) return;
+    this.addEvent({
+      id: generateId(),
+      sessionId: this.sessionId,
+      timestamp: this.timestamp(),
       type: 'Submit',
       payload: {
-        ...selectorPayload,
-        formAction: form.action || undefined,
-        formMethod: form.method || undefined
-      }
-    });
+        ...this.target(form),
+        formAction: form.getAttribute('action') || undefined,
+        formMethod: form.getAttribute('method') || undefined,
+      },
+    } as RecordedEvent);
   }
 
-  private onKeyDown(e: KeyboardEvent) {
-    // Don't record modifier repeats as separate if needed, but include all for fidelity
+  private onKey(e: KeyboardEvent, kind: 'down' | 'up'): void {
+    if (e.repeat && kind === 'down') return;
+    if (isReplayXNode(e.target as Node)) return;
     this.addEvent({
-      id: this.generateId(),
+      id: generateId(),
       sessionId: this.sessionId,
-      timestamp: this.getTimestamp(),
+      timestamp: this.timestamp(),
       type: 'Key',
       payload: {
+        // Recording both edges without a discriminator made replay fire every
+        // key twice.
+        kind,
         key: e.key,
         code: e.code,
         altKey: e.altKey,
         ctrlKey: e.ctrlKey,
         metaKey: e.metaKey,
-        shiftKey: e.shiftKey
-      }
-    });
+        shiftKey: e.shiftKey,
+      },
+    } as RecordedEvent);
   }
 
-  private onKeyUp(e: KeyboardEvent) {
-    this.addEvent({
-      id: this.generateId(),
-      sessionId: this.sessionId,
-      timestamp: this.getTimestamp(),
-      type: 'Key',
-      payload: {
-        key: e.key,
-        code: e.code,
-        altKey: e.altKey,
-        ctrlKey: e.ctrlKey,
-        metaKey: e.metaKey,
-        shiftKey: e.shiftKey
-      }
-    });
-  }
+  /**
+   * Trailing-edge debounce. The previous logic combined a leading rate limit
+   * with a trailing timer, so it recorded where the scroll *started* and threw
+   * away where it ended - which is the only position replay cares about.
+   */
+  private onScroll(e: Event): void {
+    const isDocument = e.target === document || e.target === document.scrollingElement;
+    const element = isDocument ? null : (e.target as Element | null);
+    if (element && isReplayXNode(element)) return;
 
-  private onScroll(e: Event) {
-    // Normalize target for window-level scrolling
-    const target = e.target === document ? (document.scrollingElement || document.documentElement) : (e.target as HTMLElement);
-    
-    const selector = this.getRobustSelector(target);
+    this.pendingScroll = {
+      target: element ?? window,
+      selector: element ? getRobustSelector(element) : 'window',
+    };
 
-    // Rate limit scroll events using debounce
-    const now = Date.now();
-    if (now - this.lastScrollTime < this.SCROLL_DEBOUNCE_MS) {
-      return; // Skip this scroll event if too recent
-    }
-    this.lastScrollTime = now;
+    if (this.scrollTimer) clearTimeout(this.scrollTimer);
+    this.scrollTimer = setTimeout(() => {
+      this.scrollTimer = null;
+      const pending = this.pendingScroll;
+      this.pendingScroll = null;
+      if (!pending) return;
 
-    // Debounce scroll events
-    if (this.scrollTimeout) clearTimeout(this.scrollTimeout);
-    this.scrollTimeout = window.setTimeout(() => {
+      const isWindow = pending.target === window;
+      const el = isWindow ? null : (pending.target as Element);
       this.addEvent({
-        id: this.generateId(),
+        id: generateId(),
         sessionId: this.sessionId,
-        timestamp: this.getTimestamp(),
+        timestamp: this.timestamp(),
         type: 'Scroll',
         payload: {
-          selector,
-          scrollTop: target.scrollTop || window.scrollY,
-          scrollLeft: target.scrollLeft || window.scrollX
-        }
-      });
-    }, this.SCROLL_DEBOUNCE_MS);
+          selector: pending.selector,
+          scrollTop: isWindow ? window.scrollY : (el?.scrollTop ?? 0),
+          scrollLeft: isWindow ? window.scrollX : (el?.scrollLeft ?? 0),
+        },
+      } as RecordedEvent);
+    }, SCROLL_DEBOUNCE_MS);
   }
 
-  private onResize() {
+  private onResize(): void {
     this.addEvent({
-      id: this.generateId(),
+      id: generateId(),
       sessionId: this.sessionId,
-      timestamp: this.getTimestamp(),
+      timestamp: this.timestamp(),
       type: 'Resize',
-      payload: {
-        width: window.innerWidth,
-        height: window.innerHeight
-      }
-    });
+      payload: { width: window.innerWidth, height: window.innerHeight },
+    } as RecordedEvent);
   }
 
-  private onFocus(e: Event) {
-    const target = e.target as HTMLElement;
-    const selectorPayload = this.buildTargetPayload(target);
-
+  private onFocusChange(e: Event, type: 'Focus' | 'Blur'): void {
+    const target = this.resolveTarget(e);
+    if (!target) return;
     this.addEvent({
-      id: this.generateId(),
+      id: generateId(),
       sessionId: this.sessionId,
-      timestamp: this.getTimestamp(),
-      type: 'Focus',
-      payload: selectorPayload
-    });
+      timestamp: this.timestamp(),
+      type,
+      payload: this.target(target),
+    } as RecordedEvent);
   }
 
-  private onBlur(e: Event) {
-    const target = e.target as HTMLElement;
-    const selectorPayload = this.buildTargetPayload(target);
-
+  private onNavigation(e?: Event): void {
     this.addEvent({
-      id: this.generateId(),
+      id: generateId(),
       sessionId: this.sessionId,
-      timestamp: this.getTimestamp(),
-      type: 'Blur',
-      payload: selectorPayload
-    });
-  }
-
-  private onNavigation(e?: Event) {
-    const navigationType = this.getNavigationType(e);
-    this.addEvent({
-      id: this.generateId(),
-      sessionId: this.sessionId,
-      timestamp: this.getTimestamp(),
+      timestamp: this.timestamp(),
       type: 'Navigation',
       payload: {
         url: window.location.href,
         referrer: document.referrer,
-        navigationType
-      }
-    });
+        navigationType: this.navigationType(e),
+      },
+    } as RecordedEvent);
   }
 
-  private getNavigationType(e?: Event): 'navigate' | 'push' | 'replace' | 'back' | 'forward' {
+  private navigationType(e?: Event): 'navigate' | 'push' | 'replace' | 'back' | 'forward' {
     if (e?.type === 'popstate') {
-      const currentLength = window.history.length;
-      const previousLength = this.historyLength;
-      this.historyLength = currentLength;
-      if (currentLength < previousLength) return 'back';
-      if (currentLength > previousLength) return 'forward';
+      const current = window.history.length;
+      const previous = this.historyLength;
+      this.historyLength = current;
+      if (current < previous) return 'back';
+      if (current > previous) return 'forward';
       return 'navigate';
     }
-
     if (e?.type === 'pushstate') return 'push';
     if (e?.type === 'replacestate') return 'replace';
     return 'navigate';
   }
 
-  private generateId(): string {
-    // Fallback for non-HTTPS sites where crypto.randomUUID is unavailable
-    if (typeof crypto !== 'undefined' && crypto.randomUUID) {
-      return crypto.randomUUID();
-    }
-    return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
-  }
+  // -------------------------------------------------------------------------
+  // Infrastructure
+  // -------------------------------------------------------------------------
 
-  private setupNavigationTracking() {
-    window.addEventListener('popstate', this.boundNavigationHandler);
-    window.addEventListener('hashchange', this.boundNavigationHandler);
+  private setupNavigationTracking(): void {
+    window.addEventListener('popstate', this.onNavigationBound);
+    window.addEventListener('hashchange', this.onNavigationBound);
 
-    // Monkey-patch History API to detect SPA transitions
-    // Guard against multiple patches if the script is re-injected
-    if ((history.pushState as any)._isReplayXPatched) return;
+    const patched = history.pushState as History['pushState'] & { _replayxPatched?: boolean };
+    // The old guard returned *before* stashing the originals, so cleanup could
+    // never restore them and the patch leaked for the life of the page.
+    if (patched._replayxPatched) return;
 
-    const recorder = this;
-    const originalPushState = history.pushState;
-    const originalReplaceState = history.replaceState;
+    const originalPush = history.pushState;
+    const originalReplace = history.replaceState;
+    this.originalPushState = originalPush;
+    this.originalReplaceState = originalReplace;
 
-    history.pushState = function(...args: Parameters<typeof history.pushState>) {
-      originalPushState.apply(this, args);
-      recorder.onNavigation({ type: 'pushstate' } as Event);
+    const pushState: History['pushState'] = (...args) => {
+      originalPush.apply(history, args);
+      this.onNavigation({ type: 'pushstate' } as Event);
+    };
+    const replaceState: History['replaceState'] = (...args) => {
+      originalReplace.apply(history, args);
+      this.onNavigation({ type: 'replacestate' } as Event);
     };
 
-    history.replaceState = function(...args: Parameters<typeof history.replaceState>) {
-      originalReplaceState.apply(this, args);
-      recorder.onNavigation({ type: 'replacestate' } as Event);
-    };
-
-    (history.pushState as any)._isReplayXPatched = true;
-    (this as any)._originalPushState = originalPushState;
-    (this as any)._originalReplaceState = originalReplaceState;
+    (pushState as typeof patched)._replayxPatched = true;
+    history.pushState = pushState;
+    history.replaceState = replaceState;
   }
 
-  private cleanupNavigationTracking() {
-    window.removeEventListener('popstate', this.boundNavigationHandler);
-    window.removeEventListener('hashchange', this.boundNavigationHandler);
-    if ((this as any)._originalPushState) {
-      history.pushState = (this as any)._originalPushState;
-      history.replaceState = (this as any)._originalReplaceState;
-    }
+  private cleanupNavigationTracking(): void {
+    window.removeEventListener('popstate', this.onNavigationBound);
+    window.removeEventListener('hashchange', this.onNavigationBound);
+    if (this.originalPushState) history.pushState = this.originalPushState;
+    if (this.originalReplaceState) history.replaceState = this.originalReplaceState;
+    this.originalPushState = null;
+    this.originalReplaceState = null;
   }
 
-  private setupMutationObserver() {
+  private setupMutationObserver(): void {
+    if (!document.body || typeof MutationObserver === 'undefined') return;
+
     this.mutationObserver = new MutationObserver((mutations) => {
-      mutations.forEach((mutation) => {
-        const target = mutation.target as HTMLElement;
-        const selector = this.getRobustSelector(target);
+      for (const mutation of mutations) {
+        const target = mutation.target as Element;
+        // Our own widget and replay cursor must not pollute the recording.
+        if (isReplayXNode(target)) continue;
+        if (!this.allowMutation()) return;
 
-        let mutationEvent: Omit<MutationEvent, 'id' | 'sessionId' | 'timestamp'>;
-
-        if (mutation.type === 'childList') {
-          mutationEvent = {
-            type: 'Mutation',
-            payload: {
-              type: 'childList',
-              targetSelector: selector,
-              addedNodes: Array.from(mutation.addedNodes).map(node =>
-                node.nodeType === Node.ELEMENT_NODE ? (node as Element).outerHTML : node.textContent || ''
-              ),
-              removedNodes: Array.from(mutation.removedNodes).map(node =>
-                node.nodeType === Node.ELEMENT_NODE ? (node as Element).outerHTML : node.textContent || ''
-              )
-            }
-          };
-        } else if (mutation.type === 'attributes') {
-          mutationEvent = {
-            type: 'Mutation',
-            payload: {
-              type: 'attributes',
-              targetSelector: selector,
-              attributeName: mutation.attributeName || '',
-              attributeValue: target.getAttribute(mutation.attributeName || '') || '',
-              oldValue: mutation.oldValue || ''
-            }
-          };
-        } else if (mutation.type === 'characterData') {
-          mutationEvent = {
-            type: 'Mutation',
-            payload: {
-              type: 'characterData',
-              targetSelector: selector,
-              oldValue: mutation.oldValue || '',
-              newValue: target.textContent || ''
-            }
-          };
-        } else {
-          return; // Skip unknown mutation types
-        }
+        const payload = this.describeMutation(mutation, target);
+        if (!payload) continue;
 
         this.addEvent({
-          id: this.generateId(),
+          id: generateId(),
           sessionId: this.sessionId,
-          timestamp: this.getTimestamp(),
-          ...mutationEvent
-        });
-      });
+          timestamp: this.timestamp(),
+          type: 'Mutation',
+          payload,
+        } as RecordedEvent);
+      }
     });
 
     this.mutationObserver.observe(document.body, {
@@ -591,101 +491,176 @@ export class Recorder {
       characterData: true,
       subtree: true,
       attributeOldValue: true,
-      characterDataOldValue: true
+      characterDataOldValue: true,
     });
   }
 
-  private buildTargetPayload(el: Element): TargetPayload {
-    const selector = this.getRobustSelector(el);
-    const id = (el as HTMLElement).id || undefined;
-    const name = (el as HTMLElement).getAttribute('name') || undefined;
-    const dataTestId = ['data-testid', 'data-cy', 'data-test', 'data-qa']
-      .map(attr => ({ attr, value: el.getAttribute(attr) }))
-      .find(item => item.value)?.value;
+  private describeMutation(mutation: MutationRecord, target: Element): MutationPayload | null {
+    const targetSelector = target.nodeType === Node.ELEMENT_NODE ? getRobustSelector(target) : '';
 
-    return {
-      selector,
-      fallbackSelectors: this.getFallbackSelectors(el, selector),
-      id,
-      name,
-      dataTestId: dataTestId || undefined,
-      targetTag: el.tagName.toLowerCase(),
-      textSnippet: (el.textContent || '').trim().slice(0, 120),
-      frameUrl: window.location.href
-    };
+    if (mutation.type === 'childList') {
+      const serialise = (nodes: NodeList) =>
+        Array.from(nodes)
+          .filter((node) => !isReplayXNode(node))
+          .map((node) =>
+            node.nodeType === Node.ELEMENT_NODE
+              ? (node as Element).outerHTML.slice(0, this.limits.maxMutationHtml)
+              : (node.textContent || '').slice(0, this.limits.maxMutationHtml),
+          );
+      const addedNodes = serialise(mutation.addedNodes);
+      const removedNodes = serialise(mutation.removedNodes);
+      if (addedNodes.length === 0 && removedNodes.length === 0) return null;
+      return { type: 'childList', targetSelector, addedNodes, removedNodes };
+    }
+
+    if (mutation.type === 'attributes') {
+      const attributeName = mutation.attributeName || '';
+      if (attributeName.startsWith('data-replayx')) return null;
+      return {
+        type: 'attributes',
+        targetSelector,
+        attributeName,
+        attributeValue: (target.getAttribute(attributeName) || '').slice(0, this.limits.maxMutationHtml),
+        oldValue: (mutation.oldValue || '').slice(0, this.limits.maxMutationHtml),
+      };
+    }
+
+    if (mutation.type === 'characterData') {
+      return {
+        type: 'characterData',
+        targetSelector,
+        oldValue: (mutation.oldValue || '').slice(0, this.limits.maxMutationHtml),
+        newValue: (mutation.target.textContent || '').slice(0, this.limits.maxMutationHtml),
+      };
+    }
+
+    return null;
   }
 
-  private getFallbackSelectors(el: Element, primary: string): string[] {
-    const selectors: string[] = [];
-
-    if ((el as HTMLElement).id) {
-      selectors.push(`#${(el as HTMLElement).id}`);
+  /** Sliding one-second budget so an animation loop cannot fill the session. */
+  private allowMutation(): boolean {
+    const now = Date.now();
+    if (now - this.mutationWindowStart >= 1000) {
+      this.mutationWindowStart = now;
+      this.mutationsInWindow = 0;
     }
+    this.mutationsInWindow += 1;
+    return this.mutationsInWindow <= this.limits.maxMutationsPerSecond;
+  }
 
-    const nameAttr = (el as HTMLElement).getAttribute('name');
-    if (nameAttr) {
-      selectors.push(`${el.tagName.toLowerCase()}[name="${nameAttr}"]`);
+  private onLimitReached(reason: string): void {
+    if (this.limitReached) return;
+    this.limitReached = true;
+    console.warn(`[ReplayX Recorder] ${reason} limit reached; no further events will be captured`);
+    // Deliberately *not* calling stop(): stop() is the caller's transition and
+    // invoking it from inside addEvent tore down listeners mid-dispatch and
+    // discarded the events it had just flushed.
+    this.flushEventsToBackground();
+  }
+
+  private resolveTarget(e: Event): Element | null {
+    const raw = (e.composedPath?.()[0] as Node | undefined) ?? (e.target as Node | null);
+    const element =
+      raw && raw.nodeType === Node.ELEMENT_NODE ? (raw as Element) : ((raw?.parentElement as Element) ?? null);
+    if (!element || isReplayXNode(element)) return null;
+    return element;
+  }
+
+  private target(el: Element): TargetPayload {
+    return buildTargetPayload(el);
+  }
+
+  private isSensitive(el: Element): boolean {
+    const type = inputElementType(el);
+    if (type === 'checkbox' || type === 'radio') return false;
+    if (type === 'password') return true;
+    if (el.hasAttribute('data-replay-mask')) return true;
+    if (el.getAttribute('autocomplete')?.match(/password|cc-|one-time-code/i)) return true;
+    const name = `${el.getAttribute('name') ?? ''} ${el.getAttribute('id') ?? ''}`;
+    return SENSITIVE_NAME.test(name);
+  }
+
+  private readValue(el: Element): { value: string; masked: boolean } {
+    const type = inputElementType(el);
+    if (type === 'checkbox' || type === 'radio') {
+      return { value: String((el as HTMLInputElement).checked), masked: false };
     }
+    if (this.isSensitive(el)) return { value: '********', masked: true };
+    if (el.hasAttribute('contenteditable')) {
+      return { value: (el as HTMLElement).innerText ?? '', masked: false };
+    }
+    const value = (el as HTMLInputElement).value;
+    return { value: typeof value === 'string' ? value : '', masked: false };
+  }
 
-    const dataAttrs = ['data-testid', 'data-cy', 'data-test', 'data-qa'];
-    dataAttrs.forEach(attr => {
-      const value = el.getAttribute(attr);
-      if (value) {
-        selectors.push(`[${attr}="${value}"]`);
+  private timestamp(): number {
+    return Date.now() - this.sessionStartTime;
+  }
+
+  private captureStorage(get: () => Storage): Record<string, string> {
+    const data: Record<string, string> = {};
+    try {
+      const storage = get();
+      for (let i = 0; i < storage.length; i++) {
+        const key = storage.key(i);
+        if (key !== null) data[key] = storage.getItem(key) ?? '';
       }
-    });
-
-    const classes = Array.from(el.classList)
-      .filter(cls => cls.length > 2 && !cls.match(/^(hover|active|focus|visited|link|disabled|enabled|checked|selected|valid|invalid|required|optional)$/i));
-    if (classes.length > 0) {
-      selectors.push(`${el.tagName.toLowerCase()}.${classes.slice(0, 3).join('.')}`);
+    } catch {
+      // Storage access throws on opaque origins and when cookies are blocked.
     }
-
-    if (primary && !selectors.includes(primary)) {
-      selectors.unshift(primary);
-    }
-
-    return selectors.filter(Boolean);
+    return data;
   }
 
-  private getRobustSelector(el: Element): string {
-    // Priority: data attributes > ID > stable classes > XPath fallback
-
-    const dataAttrs = ['data-testid', 'data-cy', 'data-test', 'data-qa'];
-    for (const attr of dataAttrs) {
-      const value = el.getAttribute(attr);
-      if (value) return `[${attr}="${value}"]`;
+  private safeCookies(): string | undefined {
+    try {
+      return document.cookie || undefined;
+    } catch {
+      return undefined;
     }
-
-    if ((el as HTMLElement).id) {
-      return `#${(el as HTMLElement).id}`;
-    }
-
-    const classes = Array.from(el.classList).filter(cls =>
-      cls.length > 2 &&
-      !cls.match(/^(hover|active|focus|visited|link|disabled|enabled|checked|selected|valid|invalid|required|optional)$/i) &&
-      !cls.match(/^(col|row|container|wrapper|item|element|component)$/i) &&
-      !cls.match(/^\d+$/)
-    );
-
-    if (classes.length > 0 && classes.length <= 3) {
-      return `${el.tagName.toLowerCase()}.${classes.join('.')}`;
-    }
-
-    const path: string[] = [];
-    let current: Element | null = el;
-
-    while (current && current !== document.body) {
-      let selector = current.tagName.toLowerCase();
-      const siblings = Array.from(current.parentElement?.children || []);
-      const index = siblings.indexOf(current) + 1;
-      if (siblings.length > 1) {
-        selector += `:nth-child(${index})`;
-      }
-      path.unshift(selector);
-      current = current.parentElement;
-    }
-
-    return path.join(' > ');
   }
+
+  private setInterceptorMode(mode: InterceptorMode): void {
+    try {
+      window.postMessage({ source: CONTENT_SOURCE, action: 'SET_MODE', mode }, '*');
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function inputElementType(el: Element): string | null {
+  const type = (el as HTMLInputElement).type;
+  return typeof type === 'string' ? type.toLowerCase() : null;
+}
+
+export function generateId(): string {
+  // crypto.randomUUID is unavailable on insecure origins.
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+/**
+ * Approximate byte cost without serialising the whole event. Only string
+ * payload fields are measured, which dominates real payload size.
+ */
+export function estimatePayloadBytes(event: RecordedEvent): number {
+  let bytes = 96; // envelope overhead
+  const payload = event.payload as unknown as Record<string, unknown>;
+  for (const value of Object.values(payload)) {
+    if (typeof value === 'string') bytes += value.length;
+    else if (Array.isArray(value)) {
+      for (const entry of value) bytes += typeof entry === 'string' ? entry.length : 8;
+    } else bytes += 8;
+  }
+  return bytes;
 }

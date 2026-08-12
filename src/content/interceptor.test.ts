@@ -1,288 +1,340 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  extractHeaders,
+  extractRequestBody,
+  installInterceptor,
+  parseResponseHeaders,
+  sanitizeBody,
+  sanitizeHeaders,
+  stripQuery,
+  truncate,
+  type InterceptorHandle,
+} from './interceptor';
+import type { NetworkCapture, NetworkMock } from '../messages';
 
-describe('Network Interceptor Tests', () => {
-  beforeEach(() => {
-    // Mock window.postMessage
-    (globalThis as any).window = {
-      postMessage: vi.fn(),
-      location: { href: 'http://example.com' }
-    };
+let handle: InterceptorHandle | null = null;
 
-    // Mock fetch and XHR
-    (globalThis as any).fetch = vi.fn();
-    (globalThis as any).XMLHttpRequest = class MockXMLHttpRequest {
-      open = vi.fn();
-      send = vi.fn();
-      setRequestHeader = vi.fn();
-      getResponseHeader = vi.fn();
-      getAllResponseHeaders = vi.fn();
-      abort = vi.fn();
-      readyState = 0;
-      status = 200;
-      responseText = '';
-      response = null;
-      onload: any = null;
-      onerror: any = null;
-      onreadystatechange: any = null;
-    };
+function setMode(mode: 'IDLE' | 'RECORD' | 'REPLAY', networkEvents?: NetworkMock[]): void {
+  window.dispatchEvent(
+    new MessageEvent('message', {
+      data: { source: 'replayx-content', action: 'SET_MODE', mode, networkEvents },
+      source: window,
+    }),
+  );
+}
+
+function capturedMessages(spy: { mock: { calls: unknown[][] } }): NetworkCapture[] {
+  return spy.mock.calls
+    .map((call) => call[0] as NetworkCapture)
+    .filter((message) => message?.action === 'NETWORK_CAPTURED');
+}
+
+beforeEach(() => {
+  delete (window as unknown as Record<string, unknown>)._replayx_interceptor_loaded;
+  delete (window as unknown as Record<string, unknown>)._replayx_interceptor_mode;
+});
+
+afterEach(() => {
+  handle?.uninstall();
+  handle = null;
+});
+
+describe('installation', () => {
+  it('is idempotent', () => {
+    handle = installInterceptor(window);
+    const second = installInterceptor(window);
+    expect(second.getMode()).toBe('IDLE');
+    second.uninstall();
   });
 
-  afterEach(() => {
-    vi.clearAllMocks();
+  it('restores the original globals on uninstall', () => {
+    const originalFetch = window.fetch;
+    const originalOpen = XMLHttpRequest.prototype.open;
+    const local = installInterceptor(window);
+    expect(window.fetch).not.toBe(originalFetch);
+    local.uninstall();
+    expect(window.fetch).toBe(originalFetch);
+    expect(XMLHttpRequest.prototype.open).toBe(originalOpen);
   });
 
-  describe('Data Sanitization', () => {
-    it('should sanitize sensitive headers', () => {
-      const headers = {
-        'Authorization': 'Bearer token123',
-        'Cookie': 'session=abc123',
-        'Content-Type': 'application/json',
-        'X-API-Key': 'secret-key'
-      };
-
-      // Import and test sanitization functions
-      // Note: These functions are internal to interceptor.ts, so we test the behavior indirectly
-      
-      // Test that authorization headers are removed
-      expect(headers['Authorization']).toBeDefined();
-      // After sanitization, this should be removed
-    });
-
-    it('should sanitize sensitive body fields', () => {
-      const body = {
-        username: 'testuser',
-        password: 'secret123',
-        email: 'test@example.com',
-        creditCard: '4111111111111111'
-      };
-
-      // After sanitization, password and creditCard should be masked
-      expect(body.password).toBe('secret123'); // Before sanitization
-      // After sanitization: expect(maskedBody.password).toBe('*****');
-    });
-
-    it('should sanitize sensitive URL parameters', () => {
-      // URL sanitization is handled by the interceptor's sanitizeUrl function
-      // This test validates the concept
-      const urlWithSensitiveParams = 'http://example.com/api?token=secret123&apikey=abc456&id=123';
-      expect(urlWithSensitiveParams).toContain('token=secret123');
-      // After sanitization, sensitive params would be masked
-    });
+  it('ignores SET_MODE messages that did not come from this window', () => {
+    handle = installInterceptor(window);
+    // The host page shares this window, so cross-window messages are untrusted.
+    window.dispatchEvent(
+      new MessageEvent('message', {
+        data: { source: 'replayx-content', action: 'SET_MODE', mode: 'RECORD' },
+        source: null,
+      }),
+    );
+    expect(handle.getMode()).toBe('IDLE');
   });
 
-  describe('Fetch Interception', () => {
-    it('should intercept fetch requests', async () => {
-      const mockFetch = (globalThis as any).fetch;
-      mockFetch.mockResolvedValue({
-        ok: true,
-        status: 200,
-        json: async () => ({ data: 'test' }),
-        headers: new Headers()
-      });
+  it('accepts SET_MODE from this window', () => {
+    handle = installInterceptor(window);
+    setMode('RECORD');
+    expect(handle.getMode()).toBe('RECORD');
+  });
+});
 
-      const response = await fetch('http://example.com/api');
-      
-      expect(mockFetch).toHaveBeenCalled();
-      expect(response.ok).toBe(true);
-    });
+describe('XMLHttpRequest.open', () => {
+  it('forwards the method and url to the original implementation', () => {
+    // The previous build forwarded only the trailing args, so `open` was
+    // effectively called with no method and no url - breaking every XHR on
+    // every page the extension ran on.
+    const original = vi.fn();
+    const proto = XMLHttpRequest.prototype as unknown as { open: unknown };
+    const saved = proto.open;
+    proto.open = original;
 
-    it('should handle fetch errors gracefully', async () => {
-      const mockFetch = (globalThis as any).fetch;
-      mockFetch.mockRejectedValue(new Error('Network error'));
+    handle = installInterceptor(window);
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', 'https://api.example.com/things', true);
 
-      await expect(fetch('http://example.com/api')).rejects.toThrow('Network error');
-    });
-
-    it('should sanitize request headers before sending', async () => {
-      const mockFetch = (globalThis as any).fetch;
-      mockFetch.mockResolvedValue({
-        ok: true,
-        status: 200,
-        json: async () => ({}),
-        headers: new Headers()
-      });
-
-      await fetch('http://example.com/api', {
-        headers: {
-          'Authorization': 'Bearer token',
-          'Content-Type': 'application/json'
-        }
-      } as RequestInit);
-
-      // Verify that the interceptor was called and headers were sanitized
-      expect(mockFetch).toHaveBeenCalled();
-    });
+    expect(original).toHaveBeenCalledWith('POST', 'https://api.example.com/things', true);
+    handle.uninstall();
+    proto.open = saved;
   });
 
-  describe('XHR Interception', () => {
-    it('should intercept XHR requests', () => {
-      const XHR = (globalThis as any).XMLHttpRequest;
-      const xhr = new XHR();
+  it('preserves async, user and password arguments', () => {
+    const original = vi.fn();
+    const proto = XMLHttpRequest.prototype as unknown as { open: unknown };
+    const saved = proto.open;
+    proto.open = original;
 
-      xhr.open('GET', 'http://example.com/api');
-      xhr.send();
+    handle = installInterceptor(window);
+    new XMLHttpRequest().open('GET', '/x', false, 'user', 'pass');
 
-      expect(xhr.open).toHaveBeenCalledWith('GET', 'http://example.com/api');
-      expect(xhr.send).toHaveBeenCalled();
-    });
+    expect(original).toHaveBeenCalledWith('GET', '/x', false, 'user', 'pass');
+    handle.uninstall();
+    proto.open = saved;
+  });
+});
 
-    it('should handle XHR errors gracefully', () => {
-      const XHR = (globalThis as any).XMLHttpRequest;
-      const xhr = new XHR();
+describe('fetch in IDLE mode', () => {
+  it('passes straight through without emitting anything', async () => {
+    const original = vi.fn(async () => new Response('ok', { status: 200 }));
+    window.fetch = original as unknown as typeof window.fetch;
+    const posted = vi.spyOn(window, 'postMessage');
 
-      xhr.open('GET', 'http://example.com/api');
-      
-      // Simulate error
-      if (xhr.onerror) {
-        xhr.onerror(new Event('error'));
-      }
+    handle = installInterceptor(window);
+    const response = await window.fetch('https://example.com/api');
 
-      expect(xhr.open).toHaveBeenCalled();
-    });
+    expect(await response.text()).toBe('ok');
+    expect(original).toHaveBeenCalledOnce();
+    expect(capturedMessages(posted)).toHaveLength(0);
+  });
+});
 
-    it('should sanitize XHR request headers', () => {
-      const XHR = (globalThis as any).XMLHttpRequest;
-      const xhr = new XHR();
+describe('fetch in RECORD mode', () => {
+  it('captures the exchange and still returns a readable response', async () => {
+    window.fetch = (async () =>
+      new Response('{"ok":true}', {
+        status: 201,
+        headers: { 'content-type': 'application/json' },
+      })) as unknown as typeof window.fetch;
+    const posted = vi.spyOn(window, 'postMessage');
 
-      xhr.open('POST', 'http://example.com/api');
-      xhr.setRequestHeader('Authorization', 'Bearer token');
-      xhr.setRequestHeader('Content-Type', 'application/json');
-      xhr.send();
+    handle = installInterceptor(window);
+    setMode('RECORD');
 
-      expect(xhr.setRequestHeader).toHaveBeenCalledWith('Authorization', 'Bearer token');
-      expect(xhr.setRequestHeader).toHaveBeenCalledWith('Content-Type', 'application/json');
-    });
+    const response = await window.fetch('https://example.com/api', { method: 'POST', body: '{"q":1}' });
+    // The response body must remain consumable by the page.
+    expect(await response.text()).toBe('{"ok":true}');
+
+    const [capture] = capturedMessages(posted);
+    expect(capture).toBeDefined();
+    expect(capture!.method).toBe('POST');
+    expect(capture!.url).toBe('https://example.com/api');
+    expect(capture!.responseStatus).toBe(201);
+    expect(capture!.responseBody).toBe('{"ok":true}');
+    expect(typeof capture!.timestamp).toBe('number');
   });
 
-  describe('Replay Mode', () => {
-    it('should mock network responses in replay mode', async () => {
-      // Set replay mode
-      (globalThis as any).window.postMessage({
-        source: 'replayx-content',
-        action: 'SET_MODE',
-        mode: 'REPLAY'
-      }, '*');
+  it('reports a failure so the pending-request count cannot leak', async () => {
+    // Without this the replayer's settle logic waited the full timeout after
+    // every failed request for the rest of the session.
+    window.fetch = (async () => {
+      throw new TypeError('network down');
+    }) as unknown as typeof window.fetch;
+    const posted = vi.spyOn(window, 'postMessage');
 
-      const mockFetch = (globalThis as any).fetch;
-      mockFetch.mockResolvedValue({
-        ok: true,
-        status: 200,
-        json: async () => ({ data: 'mocked' }),
-        headers: new Headers()
-      });
+    handle = installInterceptor(window);
+    setMode('RECORD');
 
-      await fetch('http://example.com/api');
-      
-      // In replay mode, the response should be mocked
-      expect(mockFetch).toHaveBeenCalled();
-    });
+    await expect(window.fetch('https://example.com/api')).rejects.toThrow('network down');
 
-    it('should match network events during replay', () => {
-      // Test that the interceptor can match recorded network events
-      const recordedEvents = [
-        {
-          id: 'event-1',
-          method: 'GET',
-          url: 'http://example.com/api',
-          requestBody: null,
-          responseBody: { data: 'test' }
-        }
-      ];
-
-      // When a request is made during replay, it should match the recorded event
-      expect(recordedEvents[0]?.url).toBe('http://example.com/api');
-    });
+    const actions = posted.mock.calls.map(([m]) => (m as { action?: string })?.action);
+    expect(actions).toContain('NETWORK_REQUEST_STARTED');
+    expect(actions).toContain('NETWORK_REQUEST_FAILED');
   });
 
-  describe('FormData Handling', () => {
-    it('should handle FormData in requests', () => {
-      const formData = new FormData();
-      formData.append('username', 'testuser');
-      formData.append('password', 'secret123');
+  it('balances started and finished for a successful request', async () => {
+    window.fetch = (async () => new Response('x')) as unknown as typeof window.fetch;
+    const posted = vi.spyOn(window, 'postMessage');
 
-      const XHR = (globalThis as any).XMLHttpRequest;
-      const xhr = new XHR();
+    handle = installInterceptor(window);
+    setMode('RECORD');
+    await window.fetch('https://example.com/api');
 
-      xhr.open('POST', 'http://example.com/api');
-      xhr.send(formData);
+    const actions = posted.mock.calls.map(([m]) => (m as { action?: string })?.action);
+    expect(actions.filter((a) => a === 'NETWORK_REQUEST_STARTED')).toHaveLength(1);
+    expect(actions.filter((a) => a === 'NETWORK_REQUEST_FINISHED')).toHaveLength(1);
+  });
+});
 
-      expect(xhr.send).toHaveBeenCalledWith(formData);
-    });
+describe('fetch in REPLAY mode', () => {
+  const mock: NetworkMock = {
+    id: 'net-1',
+    method: 'GET',
+    url: 'https://example.com/api/items',
+    responseStatus: 200,
+    responseHeaders: { 'content-type': 'application/json' },
+    responseBody: '{"items":[1,2]}',
+  };
 
-    it('should sanitize FormData fields', () => {
-      const formData = new FormData();
-      formData.append('username', 'testuser');
-      formData.append('password', 'secret123');
+  it('serves a recorded response without hitting the network', async () => {
+    const original = vi.fn();
+    window.fetch = original as unknown as typeof window.fetch;
 
-      // After sanitization, password should be masked
-      // This is handled by the interceptor's body sanitization
-    });
+    handle = installInterceptor(window);
+    setMode('REPLAY', [mock]);
+
+    const response = await window.fetch('https://example.com/api/items');
+    expect(original).not.toHaveBeenCalled();
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ items: [1, 2] });
   });
 
-  describe('Error Handling', () => {
-    it('should handle malformed request bodies', () => {
-      const invalidBody = { invalid: 'data' };
+  it('consumes each mock only once', async () => {
+    const original = vi.fn(async () => new Response('live'));
+    window.fetch = original as unknown as typeof window.fetch;
 
-      expect(() => {
-        // The interceptor should handle malformed data gracefully
-        JSON.stringify(invalidBody);
-      }).not.toThrow();
-    });
+    handle = installInterceptor(window);
+    setMode('REPLAY', [mock]);
 
-    it('should handle missing response data', () => {
-      const mockFetch = (globalThis as any).fetch;
-      mockFetch.mockResolvedValue({
-        ok: false,
-        status: 404,
-        json: async () => ({ error: 'Not found' }),
-        headers: new Headers()
-      });
+    await window.fetch('https://example.com/api/items');
+    await window.fetch('https://example.com/api/items');
 
-      expect(async () => {
-        await fetch('http://example.com/api');
-      }).not.toThrow();
-    });
+    expect(original).toHaveBeenCalledOnce();
   });
 
-  describe('Performance', () => {
-    it('should handle high-frequency requests', async () => {
-      const mockFetch = (globalThis as any).fetch;
-      mockFetch.mockResolvedValue({
-        ok: true,
-        status: 200,
-        json: async () => ({ data: 'test' }),
-        headers: new Headers()
-      });
+  it('matches ignoring the query string when the exact url misses', async () => {
+    const original = vi.fn(async () => new Response('live'));
+    window.fetch = original as unknown as typeof window.fetch;
 
-      // Make multiple concurrent requests
-      const requests = Array.from({ length: 100 }, () => 
-        fetch('http://example.com/api')
-      );
+    handle = installInterceptor(window);
+    setMode('REPLAY', [mock]);
 
-      await Promise.all(requests);
+    const response = await window.fetch('https://example.com/api/items?page=2');
+    expect(original).not.toHaveBeenCalled();
+    expect(await response.text()).toBe('{"items":[1,2]}');
+  });
 
-      expect(mockFetch).toHaveBeenCalledTimes(100);
+  it('falls through to the network when nothing matches', async () => {
+    const original = vi.fn(async () => new Response('live'));
+    window.fetch = original as unknown as typeof window.fetch;
+
+    handle = installInterceptor(window);
+    setMode('REPLAY', [mock]);
+
+    const response = await window.fetch('https://example.com/other');
+    expect(original).toHaveBeenCalledOnce();
+    expect(await response.text()).toBe('live');
+  });
+
+  it('does not throw building a mock for a null-body status', async () => {
+    window.fetch = (async () => new Response('live')) as unknown as typeof window.fetch;
+    handle = installInterceptor(window);
+    setMode('REPLAY', [{ ...mock, responseStatus: 204, responseBody: '' }]);
+
+    const response = await window.fetch('https://example.com/api/items');
+    expect(response.status).toBe(204);
+  });
+});
+
+describe('sanitizeHeaders', () => {
+  it('drops credential-bearing headers', () => {
+    const result = sanitizeHeaders({
+      Authorization: 'Bearer abc',
+      Cookie: 'sid=1',
+      'X-API-Key': 'k',
+      'Content-Type': 'application/json',
     });
+    expect(result).toEqual({ 'Content-Type': 'application/json' });
+  });
 
-    it('should not block on network interception', async () => {
-      const mockFetch = (globalThis as any).fetch;
-      mockFetch.mockImplementation(() => 
-        new Promise(resolve => 
-          setTimeout(() => resolve({
-            ok: true,
-            status: 200,
-            json: async () => ({ data: 'test' }),
-            headers: new Headers()
-          }), 10)
-        )
-      );
+  it('is case insensitive', () => {
+    expect(sanitizeHeaders({ AUTHORIZATION: 'x' })).toEqual({});
+  });
 
-      const startTime = Date.now();
-      await fetch('http://example.com/api');
-      const duration = Date.now() - startTime;
+  it('tolerates an empty input', () => {
+    expect(sanitizeHeaders({})).toEqual({});
+  });
+});
 
-      // Should complete quickly despite interception
-      expect(duration).toBeLessThan(100);
+describe('sanitizeBody', () => {
+  it('masks sensitive JSON fields at any depth', () => {
+    const masked = JSON.parse(
+      sanitizeBody('{"user":{"name":"ada","password":"x","nested":{"api_key":"y"}},"ok":true}'),
+    );
+    expect(masked.user.name).toBe('ada');
+    expect(masked.user.password).toBe('*****');
+    expect(masked.user.nested.api_key).toBe('*****');
+    expect(masked.ok).toBe(true);
+  });
+
+  it('masks inside arrays', () => {
+    const masked = JSON.parse(sanitizeBody('[{"token":"a"},{"token":"b"}]'));
+    expect(masked).toEqual([{ token: '*****' }, { token: '*****' }]);
+  });
+
+  it('masks urlencoded bodies', () => {
+    // Form-encoded bodies were previously stored completely unmasked.
+    const masked = sanitizeBody('username=ada&password=hunter2');
+    expect(masked).toContain('username=ada');
+    expect(masked).not.toContain('hunter2');
+  });
+
+  it('returns malformed JSON unchanged rather than throwing', () => {
+    expect(sanitizeBody('{not json')).toBe('{not json');
+  });
+
+  it('passes through empty input', () => {
+    expect(sanitizeBody(undefined)).toBe('');
+  });
+});
+
+describe('pure helpers', () => {
+  it('truncates oversized bodies and flags it', () => {
+    const result = truncate('x'.repeat(200), 50);
+    expect(result.truncated).toBe(true);
+    expect(result.value.length).toBeLessThan(80);
+    expect(truncate('short', 50)).toEqual({ value: 'short', truncated: false });
+  });
+
+  it('strips query and hash', () => {
+    expect(stripQuery('https://a.test/p?x=1#y')).toBe('https://a.test/p');
+    expect(stripQuery('https://a.test/p')).toBe('https://a.test/p');
+  });
+
+  it('parses response header blocks', () => {
+    expect(parseResponseHeaders('Content-Type: text/html\r\nX-Trace: abc\r\n')).toEqual({
+      'Content-Type': 'text/html',
+      'X-Trace': 'abc',
     });
+    expect(parseResponseHeaders('')).toEqual({});
+  });
+
+  it('extracts headers from every accepted shape', () => {
+    expect(extractHeaders({ A: '1' })).toEqual({ A: '1' });
+    expect(extractHeaders([['B', '2']])).toEqual({ B: '2' });
+    expect(extractHeaders(new Headers({ c: '3' }))).toEqual({ c: '3' });
+    expect(extractHeaders()).toEqual({});
+  });
+
+  it('extracts request bodies from strings and URLSearchParams', async () => {
+    expect(await extractRequestBody('/x', { body: 'raw' })).toBe('raw');
+    expect(await extractRequestBody('/x', { body: new URLSearchParams({ a: '1' }) })).toBe('a=1');
+    expect(await extractRequestBody('/x')).toBeUndefined();
   });
 });

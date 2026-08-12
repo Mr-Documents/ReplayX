@@ -1,25 +1,18 @@
 {
   "manifest_version": 3,
   "name": "ReplayX",
-  "version": "1.0",
+  "version": "1.0.0",
   "description": "Deterministic session recorder and replay tool",
-  "permissions": [
-    "storage",
-    "scripting",
-    "activeTab",
-    "downloads"
-  ],
-  "host_permissions": [
-    "http://*/*",
-    "https://*/*"
-  ],
+  "minimum_chrome_version": "116",
+  "permissions": ["storage", "scripting", "activeTab", "alarms"],
+  "host_permissions": ["http://*/*", "https://*/*"],
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' https://* http://*;"
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self';"
   },
   "icons": {
-    "16": "public/favicon.svg",
-    "48": "public/favicon.svg",
-    "128": "public/favicon.svg"
+    "16": "favicon.svg",
+    "48": "favicon.svg",
+    "128": "favicon.svg"
   },
   "action": {
     "default_popup": "index.html",
@@ -33,19 +26,15 @@
     {
       "matches": ["http://*/*", "https://*/*"],
       "js": ["src/content/main.ts"],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": false
     },
     {
       "matches": ["http://*/*", "https://*/*"],
-      "js": ["src/content/interceptor.ts"],
+      "js": ["src/content/interceptor.entry.ts"],
       "run_at": "document_start",
-      "world": "MAIN"
-    }
-  ],
-  "web_accessible_resources": [
-    {
-      "resources": ["src/content/interceptor.ts"],
-      "matches": ["http://*/*", "https://*/*"]
+      "world": "MAIN",
+      "all_frames": false
     }
   ]
 }

@@ -6,41 +6,43 @@
     <title>ReplayX</title>
   </head>
   <body>
-    <h2>ReplayX <span id="status" style="font-size: 14px; color: #718096; font-weight: normal; float: right; margin-top: 2px;">Idle</span></h2>
+    <h2>ReplayX <span id="status" class="status-pill">Idle</span></h2>
+
+    <div id="error-banner" class="error-banner" role="alert" style="display: none"></div>
 
     <div class="controls">
       <button id="start-btn">Start Recording</button>
       <button id="pause-btn" disabled>Pause</button>
-      <button id="resume-btn" disabled style="display: none;">Resume</button>
+      <button id="resume-btn" disabled style="display: none">Resume</button>
       <button id="stop-btn" disabled>Stop Recording</button>
     </div>
 
-    <div id="replay-controls" style="display: none; margin: 10px 0;">
-      <div style="margin-bottom: 8px;">
+    <div id="replay-controls" class="replay-controls" style="display: none">
+      <div class="speed-row">
         <label for="speed-control">Replay Speed: <span id="speed-value">1x</span></label>
-        <input type="range" id="speed-control" min="0.1" max="5" step="0.1" value="1">
+        <input type="range" id="speed-control" min="0.1" max="5" step="0.1" value="1" />
       </div>
-      <div style="margin-top:6px;">
-        <button id="step-btn" style="font-size: 12px; padding: 6px 10px; margin-right:8px;">Step</button>
+      <div class="replay-actions">
+        <button id="step-btn">Step</button>
+        <button id="stop-replay-btn">Stop Replay</button>
+        <span id="progress-label" class="progress-label"></span>
       </div>
-      <div id="timeline" style="width: 100%; height: 20px; background: #e2e8f0; border-radius: 10px; position: relative;">
-        <div id="progress-bar" style="height: 100%; background: #38a169; border-radius: 10px; width: 0%; transition: width 0.1s;"></div>
+      <div id="timeline" class="timeline">
+        <div id="progress-bar" class="progress-bar"></div>
       </div>
     </div>
 
-    <div style="display: flex; justify-content: space-between; align-items: center; margin: 10px 0;">
-      <div style="font-size: 13px; font-weight: 600;">Saved Sessions</div>
+    <div class="sessions-header">
+      <div class="sessions-title">Saved Sessions</div>
       <div>
-        <input type="file" id="import-input" accept=".json" style="display: none;">
-        <button id="import-btn" style="font-size: 11px; padding: 4px 8px;">Import</button>
+        <input type="file" id="import-input" accept="application/json,.json" style="display: none" />
+        <button id="import-btn" class="small-btn">Import</button>
       </div>
     </div>
 
-    <div id="sessions" class="sessions-list">
-      <!-- Session items will populate here -->
-    </div>
+    <div id="sessions" class="sessions-list"></div>
 
-    <div id="session-debugger" class="session-debugger" style="display: none;"></div>
+    <div id="session-debugger" class="session-debugger" style="display: none"></div>
 
     <script type="module" src="/src/popup.ts"></script>
   </body>

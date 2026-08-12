@@ -1,855 +1,859 @@
-import { SessionData, RecordedEvent, ReplayState, ClickPayload, InputPayload, ChangePayload, SubmitPayload, ScrollPayload, MutationPayload, NavigationPayload, FocusPayload, BlurPayload, ReplayErrorEntry } from '../types';
+import {
+  CONTENT_SOURCE,
+  isInterceptorMessage,
+  type InterceptorMode,
+  type NetworkMock,
+} from '../messages';
+import type {
+  BlurPayload,
+  ChangePayload,
+  ClickPayload,
+  FocusPayload,
+  InputPayload,
+  KeyPayload,
+  NavigationPayload,
+  NetworkPayload,
+  RecordedEvent,
+  ReplayErrorEntry,
+  ReplayState,
+  ScrollPayload,
+  SessionData,
+  SubmitPayload,
+  TargetPayload,
+} from '../types';
+import { REPLAYX_UI_ATTR } from './selector';
+
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 500;
+const FIND_TIMEOUT_MS = 3000;
+/** Loop cadence floor: `delayMs` divides by speed, so 16ms at 10x is a busy loop. */
+const MIN_TICK_MS = 8;
+/** A mutation recorded within this window of an interaction is attributed to it. */
+const MUTATION_ATTRIBUTION_MS = 1500;
+
+export interface ReplayOptions {
+  speed?: number;
+  isResume?: boolean;
+  resumeIndex?: number;
+}
+
+interface QueueItem {
+  event: RecordedEvent;
+  scheduledTime: number;
+  executed: boolean;
+}
+
+/** A cheap structural signature; `document.body.innerHTML` serialises the whole tree. */
+export interface DomFingerprint {
+  elements: number;
+  textLength: number;
+  structure: number;
+}
 
 export class Replayer {
-  private isReplaying = false;
-  private state: ReplayState = {
-    isPlaying: false,
-    currentTime: 0,
-    speed: 1,
-    paused: false
-  };
+  private replaying = false;
+  private state: ReplayState = { isPlaying: false, currentTime: 0, speed: 1, paused: false };
 
-  private eventQueue: Array<{
-    event: RecordedEvent;
-    scheduledTime: number;
-    executed: boolean;
-  }> = [];
+  private eventQueue: QueueItem[] = [];
   private nextEventIndex = 0;
+  private startIndex = 0;
 
   private cursor: HTMLElement | null = null;
-  private replayStartTime: number = 0;
+  private replayStartTime = 0;
   private session: SessionData | null = null;
-  private startIndex: number = 0;
-  private pendingNetworkRequests: number = 0;
-  private lastNetworkActivityAt: number = 0;
-  private lastDomMutationAt: number = 0;
-  private domMutationCount: number = 0;
+
+  private pendingNetworkRequests = 0;
+  private lastNetworkActivityAt = 0;
+  private lastDomMutationAt = 0;
+  private domMutationCount = 0;
   private domStabilityObserver: MutationObserver | null = null;
+
+  /** Event ids the *recording* observed a DOM change after. */
+  private eventsExpectingDomChange = new Set<string>();
+
+  private replayErrors: ReplayErrorEntry[] = [];
+  private retryCount = new Map<string, number>();
 
   public onStop?: () => void;
 
-  // Async event handling
-  private microtaskQueue: Function[] = [];
-  private macrotaskQueue: Function[] = [];
-  private isProcessingQueues = false;
+  private readonly onUnload = () => this.stop(false);
+  private readonly onKeyboardControl = (e: KeyboardEvent) => {
+    if (e.key === ' ') {
+      e.preventDefault();
+      if (this.state.paused) this.resume();
+      else this.pause();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      this.stop(false);
+    }
+  };
+  private readonly onInterceptorMessage = (event: MessageEvent) => {
+    if (event.source !== window || !isInterceptorMessage(event.data)) return;
+    switch (event.data.action) {
+      case 'NETWORK_REQUEST_STARTED':
+        this.pendingNetworkRequests += 1;
+        this.lastNetworkActivityAt = performance.now();
+        break;
+      case 'NETWORK_REQUEST_FINISHED':
+      case 'NETWORK_REQUEST_FAILED':
+        this.pendingNetworkRequests = Math.max(0, this.pendingNetworkRequests - 1);
+        this.lastNetworkActivityAt = performance.now();
+        break;
+      case 'MOCK_CONSUMED':
+        this.lastNetworkActivityAt = performance.now();
+        break;
+    }
+  };
 
-  // Error tracking
-  private replayErrors: Array<{
-    event: RecordedEvent;
-    code: string;
-    message: string;
-    details?: string;
-    stage?: string;
-    timestamp: number;
-  }> = [];
-
-  // Retry configuration
-  private readonly MAX_RETRIES = 3;
-  private readonly RETRY_DELAY_MS = 500;
-  private retryCount = new Map<string, number>();
-
-  private boundUnloadHandler = () => this.stop(false);
-
-  async start(session: SessionData & { initialState?: any }, options: { speed?: number; isResume?: boolean; resumeIndex?: number } = {}) {
-    if (this.isReplaying) return;
-    this.isReplaying = true;
+  async start(session: SessionData, options: ReplayOptions = {}): Promise<void> {
+    if (this.replaying) return;
+    this.replaying = true;
     this.session = session;
-    this.state.speed = options.speed || 1;
+    this.state.speed = clampSpeed(options.speed ?? 1);
+    this.state.paused = false;
     this.replayStartTime = performance.now();
     this.replayErrors = [];
+    this.retryCount.clear();
+    (window as unknown as Record<string, unknown>)._replayx_is_replaying = true;
 
-    // Set global flag to prevent recorder from capturing replayed events
-    (window as any)._replayx_is_replaying = true;
+    const isResuming = options.isResume || readSession('replayx_active') === 'true';
+    const isSessionStartPage = normalizeUrl(window.location.href) === normalizeUrl(session.url);
 
-    const isResuming = options.isResume || sessionStorage.getItem('replayx_active') === 'true';
-    const currentUrl = this.normalizeUrl(window.location.href);
-    const sessionStartUrl = this.normalizeUrl(session.url);
-    const isSessionStartPage = currentUrl === sessionStartUrl;
+    if (!isResuming) writeSession('replayx_event_index', '0');
 
-    if (!isResuming) {
-      sessionStorage.setItem('replayx_event_index', '0');
-    }
-
-    // Restore initial state only when we are replaying from the first recorded page.
     if (session.initialState && !isResuming && isSessionStartPage) {
-      console.log('[ReplayX Replayer] Initial state found. Selectively restoring storage...');
-      
-      // Only clear and restore keys that were actually recorded in the session
-      // This prevents destroying user data that wasn't part of the recording
-      const recordedLocalKeys = Object.keys(session.initialState.localStorage || {});
-      const recordedSessionKeys = Object.keys(session.initialState.sessionStorage || []);
-
-      // Clear only recorded keys from localStorage
-      recordedLocalKeys.forEach(key => {
-        try {
-          localStorage.removeItem(key);
-        } catch (e) {
-          console.warn('[ReplayX Replayer] Failed to clear localStorage key:', key);
-        }
-      });
-
-      // Clear only recorded keys from sessionStorage
-      recordedSessionKeys.forEach(key => {
-        try {
-          sessionStorage.removeItem(key);
-        } catch (e) {
-          console.warn('[ReplayX Replayer] Failed to clear sessionStorage key:', key);
-        }
-      });
-
-      // Restore localStorage safely
-      if (session.initialState.localStorage) {
-        Object.entries(session.initialState.localStorage).forEach(([k, v]) => {
-          try {
-            localStorage.setItem(k, v as string);
-          } catch (e) {
-            console.warn('[ReplayX Replayer] Failed to restore localStorage key:', k);
-          }
-        });
-      }
-
-      // Restore sessionStorage safely
-      if (session.initialState.sessionStorage) {
-        Object.entries(session.initialState.sessionStorage).forEach(([k, v]) => {
-          try {
-            sessionStorage.setItem(k, v as string);
-          } catch (e) {
-            console.warn('[ReplayX Replayer] Failed to restore sessionStorage key:', k);
-          }
-        });
-      }
-      
-      // Set control flag AFTER restoration so it isn't wiped
-      sessionStorage.setItem('replayx_active', 'true');
-      
-      // A reload is required for the app to initialize with the injected storage
-      console.log('[ReplayX Replayer] Initial state restored. Reloading to initialize app...');
-      window.location.reload();
-      return;
+      this.restoreInitialState(session);
+      return; // restoreInitialState reloads the page
     }
 
-    if (!sessionStorage.getItem('replayx_active')) {
-      sessionStorage.setItem('replayx_active', 'true');
-    }
-
-    console.log('[ReplayX Replayer] Starting deterministic replay for session:', session.id);
+    if (!readSession('replayx_active')) writeSession('replayx_active', 'true');
 
     this.pendingNetworkRequests = 0;
     this.lastNetworkActivityAt = performance.now();
     this.lastDomMutationAt = performance.now();
     this.domMutationCount = 0;
+    this.indexExpectedMutations(session.events);
     this.setupDomStabilityObserver();
 
-    // Configure network interceptor
-    window.postMessage({
-      source: 'replayx-content',
-      action: 'SET_MODE',
-      mode: 'REPLAY',
-      networkEvents: session.events.filter(e => e.type === 'Network').map(e => ({
-        id: e.id,
-        ...e.payload
-      }))
-    }, '*');
-
-    // Listen for interceptor messages about network activity and mocks being consumed
-    window.addEventListener('message', this.boundInterceptorMessage);
+    this.setInterceptorMode('REPLAY', collectNetworkMocks(session.events));
+    window.addEventListener('message', this.onInterceptorMessage);
+    window.addEventListener('beforeunload', this.onUnload);
+    document.addEventListener('keydown', this.onKeyboardControl);
 
     this.createCursor();
     this.scheduleEvents(session.events, options.resumeIndex);
-    window.addEventListener('beforeunload', this.boundUnloadHandler);
 
-    // Start replay loop
     this.state.isPlaying = true;
-    this.replayLoop();
-
-    // Set up replay controls
-    this.setupKeyboardControls();
+    void this.replayLoop();
   }
 
-  private boundInterceptorMessage = (ev: MessageEvent) => {
-    try {
-      if (!ev.data || ev.data.source !== 'replayx-interceptor') return;
-      if (ev.data.action === 'MOCK_CONSUMED') {
-        this.lastNetworkActivityAt = performance.now();
-      } else if (ev.data.action === 'NETWORK_REQUEST_STARTED') {
-        this.pendingNetworkRequests = Math.max(0, this.pendingNetworkRequests + 1);
-        this.lastNetworkActivityAt = performance.now();
-      } else if (ev.data.action === 'NETWORK_REQUEST_FINISHED' || ev.data.action === 'NETWORK_REQUEST_FAILED') {
-        this.pendingNetworkRequests = Math.max(0, this.pendingNetworkRequests - 1);
-        this.lastNetworkActivityAt = performance.now();
-      }
-    } catch (e) {}
-  }
-
-  public isActive(): boolean {
-    return this.isReplaying;
-  }
-
-  stop(isFinished = false) {
-    if (!this.isReplaying) return;
-    this.isReplaying = false;
+  stop(isFinished = false): void {
+    if (!this.replaying) return;
+    this.replaying = false;
     this.state.isPlaying = false;
     this.eventQueue = [];
-    (window as any)._replayx_is_replaying = false;
-    window.removeEventListener('beforeunload', this.boundUnloadHandler);
-    this.microtaskQueue = [];
-    this.macrotaskQueue = [];
+    (window as unknown as Record<string, unknown>)._replayx_is_replaying = false;
+
+    // Previously stop() rewrote itself with a wrapper on every start(), so each
+    // record/replay cycle nested another closure and leaked the old listeners.
+    window.removeEventListener('beforeunload', this.onUnload);
+    window.removeEventListener('message', this.onInterceptorMessage);
+    document.removeEventListener('keydown', this.onKeyboardControl);
+
     this.disconnectDomStabilityObserver();
     this.retryCount.clear();
+    this.cursor?.remove();
+    this.cursor = null;
+    this.setInterceptorMode('IDLE');
 
-    if (this.cursor) {
-      this.cursor.remove();
-      this.cursor = null;
-    }
-
-    // Reset interceptor
-    window.postMessage({
-      source: 'replayx-content',
-      action: 'SET_MODE',
-      mode: 'IDLE'
-    }, '*');
-
-    window.removeEventListener('message', this.boundInterceptorMessage);
-
-    // Signal completion to the background script so it can clear the active session state.
-    // This must be sent whenever replaying stops to ensure the background script 
-    // doesn't stay in a "replaying" state.
     if (isFinished) {
-      // Clear client-side state immediately so UI reflects completion quickly
-      try {
-        sessionStorage.removeItem('replayx_active');
-        sessionStorage.removeItem('replayx_event_index');
-      } catch (e) {
-        console.warn('[ReplayX Replayer] Failed to clear sessionStorage on finish', e);
-      }
-
-      // Notify background and log the result. Use callback to surface errors.
-      if (chrome?.runtime?.sendMessage) {
-        chrome.runtime.sendMessage({ action: 'REPLAY_FINISHED', errors: this.replayErrors }, (resp) => {
-          if (chrome.runtime.lastError) {
-            console.warn('[ReplayX Replayer] REPLAY_FINISHED message failed:', chrome.runtime.lastError.message);
-          } else {
-            console.log('[ReplayX Replayer] Background acknowledged REPLAY_FINISHED', resp);
-          }
-        });
-      } else {
-        console.log('[ReplayX Replayer] No chrome.runtime available to send REPLAY_FINISHED');
-      }
-    } else {
-      // Don't remove replayx_active if we are just navigating
+      removeSession('replayx_active');
+      removeSession('replayx_event_index');
+      this.notifyFinished();
     }
 
-    if (this.onStop) this.onStop();
-    console.log('[ReplayX Replayer] Replay stopped');
+    this.onStop?.();
+    console.info('[ReplayX Replayer] Replay stopped');
   }
 
-  public async step() {
-    if (!this.isReplaying) return;
-    // execute a single event regardless of timing
-    if (this.nextEventIndex >= this.eventQueue.length) return;
+  pause(): void {
+    this.state.paused = true;
+  }
 
+  resume(): void {
+    this.state.paused = false;
+  }
+
+  setSpeed(speed: number): void {
+    this.state.speed = clampSpeed(speed);
+    if (this.cursor) this.cursor.style.transition = `all ${0.2 / this.state.speed}s ease-out`;
+  }
+
+  isActive(): boolean {
+    return this.replaying;
+  }
+
+  getErrors(): ReplayErrorEntry[] {
+    return this.replayErrors;
+  }
+
+  getProgress(): { index: number; total: number } {
+    return { index: this.startIndex + this.nextEventIndex, total: this.startIndex + this.eventQueue.length };
+  }
+
+  /** Human-scale pauses between synthetic interactions, scaled by replay speed. */
+  private delayMs(ms: number): Promise<void> {
+    return sleep(ms / this.state.speed);
+  }
+
+  async step(): Promise<void> {
+    if (!this.replaying) return;
     const item = this.eventQueue[this.nextEventIndex];
     if (!item) return;
-    
+
     try {
-      const navigationTriggered = await this.executeEvent(item.event);
+      const navigated = await this.executeEvent(item.event);
       item.executed = true;
       this.nextEventIndex += 1;
-
-      const progressIndex = this.startIndex + this.nextEventIndex;
-      sessionStorage.setItem('replayx_event_index', progressIndex.toString());
-      this.persistReplayProgress(progressIndex);
-
-      // Process async queues after the single step
-      await this.processAsyncQueues();
-
-      // Pause after stepping
+      this.commitProgress();
       this.pause();
-
-      if (navigationTriggered) {
-        this.stop(false);
-        return;
-      }
+      if (navigated) this.stop(false);
     } catch (error) {
-      console.error('[ReplayX Replayer] Step execution failed:', item.event, error);
-      this.recordReplayError(item.event, 'step_failed', 'Replay step failed', error instanceof Error ? error.message : String(error), 'step');
       this.nextEventIndex += 1;
+      this.recordError(item.event, 'step_failed', 'Replay step failed', errorMessage(error), 'step');
     }
   }
 
-  pause() {
-    this.state.paused = true;
-    console.log('[ReplayX Replayer] Replay paused');
-  }
+  // -------------------------------------------------------------------------
+  // Scheduling
+  // -------------------------------------------------------------------------
 
-  resume() {
-    this.state.paused = false;
-    console.log('[ReplayX Replayer] Replay resumed');
-  }
-
-  setSpeed(speed: number) {
-    this.state.speed = Math.max(0.1, Math.min(10, speed));
-    console.log('[ReplayX Replayer] Speed set to:', this.state.speed);
-    // Dynamically adjust cursor transition to match replay speed
-    if (this.cursor) {
-      this.cursor.style.transition = `all ${0.2 / this.state.speed}s ease-out`;
-    }
-  }
-
-  private scheduleEvents(events: RecordedEvent[], resumeIndex?: number) {
-    // Use index-based tracking to handle multiple visits to the same URL correctly
-    const savedIndex = sessionStorage.getItem('replayx_event_index');
-    if (savedIndex !== null) {
-      this.startIndex = parseInt(savedIndex, 10);
-    } else if (resumeIndex !== undefined) {
+  private scheduleEvents(events: RecordedEvent[], resumeIndex?: number): void {
+    // An explicit resume index is a caller instruction and must win over the
+    // page-local checkpoint, which the previous ordering ignored entirely.
+    if (typeof resumeIndex === 'number' && resumeIndex > 0) {
       this.startIndex = resumeIndex;
-      console.log('[ReplayX Replayer] Resuming from persisted background index', this.startIndex, 'for', window.location.href);
     } else {
-      this.startIndex = this.findResumeIndex(events);
-      console.log('[ReplayX Replayer] Resuming from event index', this.startIndex, 'for', window.location.href);
+      const saved = readSession('replayx_event_index');
+      const parsed = saved === null ? Number.NaN : Number.parseInt(saved, 10);
+      this.startIndex = Number.isFinite(parsed) && parsed > 0 ? parsed : this.findResumeIndex(events);
     }
+    this.startIndex = Math.min(Math.max(this.startIndex, 0), events.length);
 
-    const eventsToSchedule = events.slice(this.startIndex ?? 0);
-    const firstEvent = eventsToSchedule[0];
-    const offset = firstEvent?.timestamp ?? 0;
+    const slice = events.slice(this.startIndex);
+    const offset = slice[0]?.timestamp ?? 0;
 
-    this.eventQueue = eventsToSchedule.map(event => ({
-      event,
-      // scheduledTime is now relative to the current page load
-      scheduledTime: event.timestamp - offset,
-      executed: false
-    })).sort((a, b) => a.scheduledTime - b.scheduledTime);
+    this.eventQueue = slice
+      .map((event, index) => ({
+        event,
+        scheduledTime: Math.max(0, event.timestamp - offset),
+        executed: false,
+        order: index,
+      }))
+      // Recording order is the tie-break; a bare sort by time reorders events
+      // that share a millisecond, which for input/submit pairs is fatal.
+      .sort((a, b) => a.scheduledTime - b.scheduledTime || a.order - b.order)
+      .map(({ event, scheduledTime, executed }) => ({ event, scheduledTime, executed }));
 
     this.nextEventIndex = 0;
-    console.log(`[ReplayX Replayer] Scheduled ${this.eventQueue.length} events (offset ${offset}ms)`);
+    console.info(`[ReplayX Replayer] Scheduled ${this.eventQueue.length} events from index ${this.startIndex}`);
   }
 
   private findResumeIndex(events: RecordedEvent[]): number {
-    const currentUrl = this.normalizeUrl(window.location.href);
+    const current = normalizeUrl(window.location.href);
     for (let i = 0; i < events.length; i++) {
-      const event = events[i];
-      const payload = event?.payload;
-      if (!payload) continue;
-      const frameUrl = this.normalizeUrl(payload.frameUrl || '');
-      if (frameUrl && frameUrl === currentUrl) {
-        return i;
-      }
+      const frameUrl = events[i]?.payload?.frameUrl;
+      if (frameUrl && normalizeUrl(frameUrl) === current) return i;
     }
     return 0;
   }
 
-  private normalizeUrl(url: string): string {
-    return (url.split('#')[0] || url).replace(/\/$/, '').toLowerCase();
-  }
-
-  private persistReplayProgress(progressIndex: number) {
-    if (!this.session || !chrome.runtime?.id) return;
-    chrome.runtime.sendMessage({
-      action: 'UPDATE_REPLAY_PROGRESS',
-      sessionId: this.session.id,
-      progressIndex
-    }, () => {
-      if (chrome.runtime.lastError) {
-        console.warn('[ReplayX Replayer] Could not persist replay progress:', chrome.runtime.lastError.message);
+  /**
+   * Records which interactions were followed by a DOM mutation during the
+   * original recording. Only those are eligible for a "no DOM change" finding.
+   */
+  private indexExpectedMutations(events: RecordedEvent[]): void {
+    this.eventsExpectingDomChange.clear();
+    for (let i = 0; i < events.length; i++) {
+      const event = events[i];
+      if (!event || !isInteraction(event.type)) continue;
+      for (let j = i + 1; j < events.length; j++) {
+        const next = events[j];
+        if (!next) break;
+        if (next.timestamp - event.timestamp > MUTATION_ATTRIBUTION_MS) break;
+        if (next.type === 'Mutation' || next.type === 'Navigation') {
+          this.eventsExpectingDomChange.add(event.id);
+          break;
+        }
       }
-    });
+    }
   }
 
-  private async replayLoop() {
-    while (this.isReplaying && this.state.isPlaying) {
+  private commitProgress(): void {
+    const progressIndex = this.startIndex + this.nextEventIndex;
+    writeSession('replayx_event_index', String(progressIndex));
+    if (!this.session || typeof chrome === 'undefined' || !chrome.runtime?.id) return;
+    try {
+      chrome.runtime.sendMessage(
+        { action: 'UPDATE_REPLAY_PROGRESS', sessionId: this.session.id, progressIndex },
+        () => void chrome.runtime.lastError,
+      );
+    } catch {
+      /* the extension context can disappear mid-replay */
+    }
+  }
+
+  private async replayLoop(): Promise<void> {
+    while (this.replaying && this.state.isPlaying) {
       if (this.state.paused) {
-        await this.delayMs(100);
+        await sleep(100);
         continue;
       }
 
       const currentTime = (performance.now() - this.replayStartTime) * this.state.speed;
-      this.state.currentTime = currentTime ?? 0;
+      this.state.currentTime = currentTime;
 
-      // Execute due events in queue order
       while (this.nextEventIndex < this.eventQueue.length) {
-        const currentItem = this.eventQueue[this.nextEventIndex];
-        if (!currentItem || currentItem.executed || currentItem.scheduledTime > currentTime) break;
-        
-        const item = currentItem;
-        
-        // Frame Safety: Only execute events that belong to THIS frame
-        if (item.event.payload.frameUrl) {
-          const normalize = (u: string) => (u.split('#')[0] || u).replace(/\/$/, '').toLowerCase();
-          const frameUrl = item.event.payload.frameUrl;
-          if (frameUrl && normalize(frameUrl) !== normalize(window.location.href)) {
-            item.executed = true;
-            this.nextEventIndex += 1;
-            continue;
-          }
+        const item = this.eventQueue[this.nextEventIndex];
+        if (!item || item.executed || item.scheduledTime > currentTime) break;
+
+        if (!this.belongsToThisFrame(item.event)) {
+          item.executed = true;
+          this.nextEventIndex += 1;
+          continue;
         }
 
         try {
-          const navigationTriggered = await this.executeEvent(item.event);
+          const navigated = await this.executeEvent(item.event);
           item.executed = true;
           this.nextEventIndex += 1;
-          
-          // Persist progress across reloads and navigation.
-          const progressIndex = this.startIndex + this.nextEventIndex;
-          sessionStorage.setItem('replayx_event_index', progressIndex.toString());
-          this.persistReplayProgress(progressIndex);
-
-          if (navigationTriggered) {
-            this.stop(false); // Stop local loop but keep background session active
+          this.commitProgress();
+          if (navigated) {
+            this.stop(false); // keep the background session alive across the load
             return;
           }
         } catch (error) {
-          console.error('[ReplayX Replayer] Event execution failed:', item.event, error);
-          this.recordReplayError(item.event, 'event_failed', 'Replay event failed', error instanceof Error ? error.message : String(error), 'playback');
           this.nextEventIndex += 1;
+          // executeEvent has already recorded the failure; re-recording here
+          // produced two entries per failure in the debugger.
+          console.warn('[ReplayX Replayer] Event failed:', item.event.type, errorMessage(error));
         }
       }
 
-      // Process async queues
-      await this.processAsyncQueues();
-
-      // Check if replay is complete
       if (this.nextEventIndex >= this.eventQueue.length) {
-        console.log('[ReplayX Replayer] All events replayed');
         this.stop(true);
         return;
       }
 
-      // Small delay to prevent busy loop
-      await this.delayMs(16); // ~60fps
+      await sleep(Math.max(MIN_TICK_MS, 16 / this.state.speed));
     }
   }
 
-  private async executeEvent(event: RecordedEvent): Promise<boolean | void> {
-    const eventId = event.id;
-    
+  private belongsToThisFrame(event: RecordedEvent): boolean {
+    const frameUrl = event.payload?.frameUrl;
+    if (!frameUrl) return true;
+    return normalizeUrl(frameUrl) === normalizeUrl(window.location.href);
+  }
+
+  // -------------------------------------------------------------------------
+  // Execution
+  // -------------------------------------------------------------------------
+
+  private async executeEvent(event: RecordedEvent): Promise<boolean> {
     try {
-      let result;
+      let navigated: boolean | void;
       switch (event.type) {
         case 'Click':
-          result = await this.executeClickWithRetry(event);
-          break;
         case 'DoubleClick':
-          result = await this.executeClickWithRetry(event);
-          break;
-        case 'Key':
-          result = await this.executeKey(event);
+          navigated = await this.withRetry(event, () => this.executeClick(event));
           break;
         case 'Input':
-          result = await this.executeInputWithRetry(event);
+          navigated = await this.withRetry(event, () => this.executeInput(event));
           break;
         case 'Change':
-          result = await this.executeChange(event);
+          navigated = await this.executeChange(event);
           break;
         case 'Submit':
-          result = await this.executeSubmitWithRetry(event);
+          navigated = await this.withRetry(event, () => this.executeSubmit(event));
+          break;
+        case 'Key':
+          navigated = await this.executeKey(event);
           break;
         case 'Scroll':
-          result = await this.executeScroll(event);
-          break;
-        case 'Mutation':
-          result = await this.executeMutation(event);
+          navigated = await this.executeScroll(event);
           break;
         case 'Navigation':
-          result = await this.executeNavigation(event);
-          break;
-        case 'Resize':
-          result = await this.executeResize(event);
+          navigated = await this.executeNavigation(event);
           break;
         case 'Focus':
-          result = await this.executeFocus(event);
-          break;
         case 'Blur':
-          result = await this.executeBlur(event);
+          navigated = await this.executeFocusChange(event);
+          break;
+        // Mutations, resizes and network events are outcomes of replay, not
+        // inputs to it; replaying them would fight the page.
+        case 'Mutation':
+        case 'Resize':
+        case 'Network':
+          navigated = false;
           break;
         default:
-          console.warn('[ReplayX Replayer] Unknown event type:', event.type);
+          console.warn('[ReplayX Replayer] Unknown event type:', (event as RecordedEvent).type);
+          navigated = false;
       }
-      
-      // Reset retry count on success
-      this.retryCount.delete(eventId);
-      return result;
+      this.retryCount.delete(event.id);
+      return navigated === true;
     } catch (error) {
-      console.error('[ReplayX Replayer] Event execution failed:', event, error);
-      this.recordReplayError(event, 'event_failed', 'Replay event failed', error instanceof Error ? error.message : String(error), 'playback');
-      this.retryCount.delete(eventId);
+      this.recordError(event, 'event_failed', 'Replay event failed', errorMessage(error), 'playback');
+      this.retryCount.delete(event.id);
       throw error;
     }
   }
 
-  private async executeClickWithRetry(event: RecordedEvent): Promise<boolean | void> {
-    const eventId = event.id;
-    const currentRetries = this.retryCount.get(eventId) || 0;
-    
-    try {
-      return await this.executeClick(event);
-    } catch (error) {
-      if (currentRetries < this.MAX_RETRIES) {
-        this.retryCount.set(eventId, currentRetries + 1);
-        console.log(`[ReplayX Replayer] Retrying click event (attempt ${currentRetries + 1}/${this.MAX_RETRIES})`);
-        await this.delayMs(this.RETRY_DELAY_MS);
-        return await this.executeClickWithRetry(event);
+  private async withRetry<T>(event: RecordedEvent, run: () => Promise<T>): Promise<T> {
+    for (;;) {
+      try {
+        return await run();
+      } catch (error) {
+        const attempts = this.retryCount.get(event.id) ?? 0;
+        if (attempts >= MAX_RETRIES) throw error;
+        this.retryCount.set(event.id, attempts + 1);
+        console.info(`[ReplayX Replayer] Retry ${attempts + 1}/${MAX_RETRIES} for ${event.type}`);
+        await sleep(RETRY_DELAY_MS);
       }
-      throw error;
     }
   }
 
-  private async executeInputWithRetry(event: RecordedEvent): Promise<boolean | void> {
-    const eventId = event.id;
-    const currentRetries = this.retryCount.get(eventId) || 0;
-    
-    try {
-      return await this.executeInput(event);
-    } catch (error) {
-      if (currentRetries < this.MAX_RETRIES) {
-        this.retryCount.set(eventId, currentRetries + 1);
-        console.log(`[ReplayX Replayer] Retrying input event (attempt ${currentRetries + 1}/${this.MAX_RETRIES})`);
-        await this.delayMs(this.RETRY_DELAY_MS);
-        return await this.executeInputWithRetry(event);
-      }
-      throw error;
-    }
-  }
-
-  private async executeSubmitWithRetry(event: RecordedEvent): Promise<boolean | void> {
-    const eventId = event.id;
-    const currentRetries = this.retryCount.get(eventId) || 0;
-    
-    try {
-      return await this.executeSubmit(event);
-    } catch (error) {
-      if (currentRetries < this.MAX_RETRIES) {
-        this.retryCount.set(eventId, currentRetries + 1);
-        console.log(`[ReplayX Replayer] Retrying submit event (attempt ${currentRetries + 1}/${this.MAX_RETRIES})`);
-        await this.delayMs(this.RETRY_DELAY_MS);
-        return await this.executeSubmitWithRetry(event);
-      }
-      throw error;
-    }
-  }
-
-  private async executeClick(event: RecordedEvent) {
-    if (event.type !== 'Click') return;
+  private async executeClick(event: RecordedEvent): Promise<boolean> {
+    if (event.type !== 'Click' && event.type !== 'DoubleClick') return false;
     const payload = event.payload as ClickPayload;
-    let element = await this.findElement({ selector: payload.selector, fallbackSelectors: payload.fallbackSelectors, textSnippet: payload.textSnippet, name: payload.name, dataTestId: payload.dataTestId });
+    const element = await this.findElement(payload);
+    if (!element) return this.reportMissingTarget(event, payload, 'Click');
 
-    if (!element) {
-      const dom = document.body ? document.body.innerHTML.slice(0, 5000) : '';
-      console.warn('[ReplayX Replayer] Click target not found:', payload.selector);
-      this.recordReplayError(event, 'target_not_found', 'Click target was not found', 'The recorded selector could not be resolved during replay. The selector may have changed or the element may not yet exist.', 'find', dom, {
-        retryable: true,
-        severity: 'error',
-        selector: payload.selector,
-        targetTag: payload.targetTag,
-        expected: 'A visible target element matching the recorded selector',
-        actual: 'No matching element could be resolved during replay'
-      });
-      return;
-    }
-
-    // Ensure element is visible - 'auto' has broader support for standard DOM
     element.scrollIntoView({ behavior: 'auto', block: 'center' });
-    await this.delayMs(50);
-
-    // Move cursor
+    await this.delayMs(40);
     this.moveCursorTo(element);
-    await this.delayMs(100);
+    await this.delayMs(80);
 
-    // Use exact recorded coordinates for maximum fidelity
-    const eventOptions = {
+    const init: MouseEventInit = {
       bubbles: true,
       cancelable: true,
       clientX: payload.x,
-      clientY: payload.y
+      clientY: payload.y,
+      // `view` is deliberately omitted: the native element.click() below is what
+      // actually drives default behaviour, and passing a cross-realm window
+      // makes the MouseEvent constructor throw.
     };
-
-    element.dispatchEvent(new MouseEvent('mousedown', eventOptions));
-    await this.delayMs(20);
-    element.dispatchEvent(new MouseEvent('mouseup', eventOptions));
-    
-    // Use native click() as it triggers both the event and the default browser action
+    element.dispatchEvent(new MouseEvent('mousedown', init));
+    element.dispatchEvent(new MouseEvent('mouseup', init));
     element.click();
-    if ((payload as any).dbl) {
-      element.dispatchEvent(new MouseEvent('dblclick', eventOptions));
+    if (payload.dbl || event.type === 'DoubleClick') {
+      element.dispatchEvent(new MouseEvent('dblclick', init));
     }
 
-    // Wait for network or DOM settle heuristics
-    await this.waitForReplaySettling(1500);
+    await this.settle(event, 1500, 'interaction');
+    return false;
   }
 
-  private async executeInput(event: RecordedEvent) {
-    if (event.type !== 'Input') return;
+  private async executeInput(event: RecordedEvent): Promise<boolean> {
+    if (event.type !== 'Input') return false;
     const payload = event.payload as InputPayload;
-    const value = payload.value;
-    let element = await this.findElement({ selector: payload.selector, fallbackSelectors: payload.fallbackSelectors, textSnippet: payload.textSnippet, name: payload.name, dataTestId: payload.dataTestId });
-
-    if (!element) {
-      const dom = document.body ? document.body.innerHTML.slice(0, 5000) : '';
-      console.warn('[ReplayX Replayer] Input target not found:', payload.selector);
-      this.recordReplayError(event, 'target_not_found', 'Input target was not found', 'The recorded selector could not be resolved during replay. The form control may have changed or not yet rendered.', 'find', dom, {
-        retryable: true,
-        severity: 'error',
-        selector: payload.selector,
-        targetTag: payload.targetTag,
-        expected: 'A visible input-like element matching the recorded selector',
-        actual: 'No matching input element could be resolved during replay'
-      });
-      return;
-    }
+    const element = await this.findElement(payload);
+    if (!element) return this.reportMissingTarget(event, payload, 'Input');
 
     element.scrollIntoView({ behavior: 'auto', block: 'center' });
-    await this.delayMs(50);
-
+    await this.delayMs(30);
     this.moveCursorTo(element);
-    await this.delayMs(100);
-
-    // Focus first
     element.focus();
-    await this.delayMs(50);
+    await this.delayMs(30);
 
     if (element instanceof HTMLInputElement && (element.type === 'checkbox' || element.type === 'radio')) {
-      const isChecked = value === 'true';
-      if (element.checked !== isChecked) {
-        this.setNativeProps(element, 'checked', isChecked);
-      }
-    } 
-    // Handle contenteditable
-    else if (element.hasAttribute('contenteditable')) {
-      if (element.innerText !== value) {
-        element.innerText = value;
+      const checked = payload.value === 'true';
+      if (element.checked !== checked) setNativeProp(element, 'checked', checked);
+    } else if (element.hasAttribute('contenteditable')) {
+      if (element.innerText !== payload.value) {
+        element.innerText = payload.value;
         element.dispatchEvent(new Event('input', { bubbles: true }));
       }
-    }
-    // Standard inputs
-    else if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) {
-      if (element.value !== value) {
-        element.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: value }));
-        this.setNativeProps(element, 'value', value);
+    } else if (isFormControl(element)) {
+      if (element.value !== payload.value) {
+        element.dispatchEvent(new globalThis.InputEvent('beforeinput', { bubbles: true, data: payload.value }));
+        setNativeProp(element, 'value', payload.value);
       }
-      await this.waitForReplaySettling(1800, { eventType: 'input' });
-    }
-  }
-
-  private async executeChange(event: RecordedEvent) {
-    if (event.type !== 'Change') return;
-    const payload = event.payload as ChangePayload;
-    let element = await this.findElement({ selector: payload.selector, fallbackSelectors: payload.fallbackSelectors, textSnippet: payload.textSnippet, name: payload.name, dataTestId: payload.dataTestId });
-    if (!element) {
-      const dom = document.body ? document.body.innerHTML.slice(0, 5000) : '';
-      console.warn('[ReplayX Replayer] Change target not found:', payload.selector);
-      this.recordReplayError(event, 'target_not_found', 'Change target was not found', 'The recorded selector could not be resolved during replay. The target may have been replaced by a dynamic framework update.', 'find', dom, {
-        retryable: true,
-        severity: 'error',
-        selector: payload.selector,
-        targetTag: payload.targetTag,
-        expected: 'A visible form control matching the recorded selector',
-        actual: 'No matching control could be resolved during replay'
-      });
-      return;
-    }
-
-    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) {
-      this.setNativeProps(element, 'value', payload.value);
-      element.dispatchEvent(new Event('change', { bubbles: true }));
-      element.dispatchEvent(new Event('input', { bubbles: true }));
-    }
-  }
-
-  private async executeSubmit(event: RecordedEvent) {
-    if (event.type !== 'Submit') return;
-    const payload = event.payload as SubmitPayload;
-    let element = await this.findElement({ selector: payload.selector, fallbackSelectors: payload.fallbackSelectors, textSnippet: payload.textSnippet, name: payload.name, dataTestId: payload.dataTestId });
-    if (!element) {
-      const dom = document.body ? document.body.innerHTML.slice(0, 5000) : '';
-      console.warn('[ReplayX Replayer] Submit target not found:', payload.selector);
-      this.recordReplayError(event, 'target_not_found', 'Submit target was not found', 'The recorded selector could not be resolved during replay. The form or button may no longer exist in the same DOM position.', 'find', dom, {
-        retryable: true,
-        severity: 'error',
-        selector: payload.selector,
-        targetTag: payload.targetTag,
-        expected: 'A visible form or submit control matching the recorded selector',
-        actual: 'No matching form control could be resolved during replay'
-      });
-      return;
-    }
-
-    const form = element instanceof HTMLFormElement ? element : element.closest('form');
-    if (form) {
-      form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-      try {
-        form.requestSubmit?.();
-      } catch (e) {
-        /* ignore if not supported */
-      }
-      await this.waitForReplaySettling(1800, { eventType: 'submit' });
-    }
-  }
-
-  private async executeKey(event: RecordedEvent) {
-    if (event.type !== 'Key') return;
-    const payload = event.payload as any;
-    const active = document.activeElement as HTMLElement | null;
-    if (!active) return;
-
-    const evDown = new KeyboardEvent('keydown', {
-      key: payload.key,
-      code: payload.code,
-      altKey: !!payload.altKey,
-      ctrlKey: !!payload.ctrlKey,
-      metaKey: !!payload.metaKey,
-      shiftKey: !!payload.shiftKey,
-      bubbles: true
-    });
-    active.dispatchEvent(evDown);
-
-    const evUp = new KeyboardEvent('keyup', {
-      key: payload.key,
-      code: payload.code,
-      altKey: !!payload.altKey,
-      ctrlKey: !!payload.ctrlKey,
-      metaKey: !!payload.metaKey,
-      shiftKey: !!payload.shiftKey,
-      bubbles: true
-    });
-    active.dispatchEvent(evUp);
-  }
-
-  private async executeScroll(event: RecordedEvent) {
-    if (event.type !== 'Scroll') return;
-    const payload = event.payload as ScrollPayload;
-    const selector = payload.selector;
-    const scrollTop = payload.scrollTop;
-    const scrollLeft = payload.scrollLeft;
-
-    let element = selector === 'window' ? window : await this.findElement({ selector: payload.selector, fallbackSelectors: payload.fallbackSelectors, textSnippet: payload.textSnippet, name: payload.name, dataTestId: payload.dataTestId });
-    if (!element) return;
-
-    if (element === window) {
-      window.scrollTo(scrollLeft, scrollTop);
-    } else {
-      (element as HTMLElement).scrollTop = scrollTop;
-      (element as HTMLElement).scrollLeft = scrollLeft;
-      // Manually trigger scroll event as direct property mutation doesn't always fire it
-      element.dispatchEvent(new Event('scroll', { bubbles: true }));
-    }
-  }
-
-  private async executeMutation(event: RecordedEvent) {
-    if (event.type !== 'Mutation') return;
-    const payload = event.payload as MutationPayload;
-    // For replay, mutations are handled by the original events that caused them
-    // This is mainly for logging/debugging
-    console.log('[ReplayX Replayer] Mutation event:', payload.type, payload.targetSelector);
-  }
-
-  private async executeNavigation(event: RecordedEvent) {
-    if (event.type !== 'Navigation') return;
-    const payload = event.payload as NavigationPayload & { navigationType?: string };
-    const url = payload.url;
-    const navigationType = payload.navigationType || 'navigate';
-
-    if (navigationType === 'back') {
-      window.history.back();
-      await this.waitForReplaySettling(1800, { eventType: 'navigation' });
-      return true;
-    }
-
-    if (navigationType === 'forward') {
-      window.history.forward();
-      await this.waitForReplaySettling(1800, { eventType: 'navigation' });
-      return true;
-    }
-
-    const normalize = (u: string) => u.replace(/\/$/, '').toLowerCase();
-    if (normalize(window.location.href) !== normalize(url)) {
-      console.log('[ReplayX Replayer] Redirecting to next page:', url);
-      window.location.assign(url);
-      await this.waitForReplaySettling(2500, { eventType: 'navigation' });
-      return true;
+      await this.settle(event, 1200, 'input');
     }
     return false;
   }
 
-  private waitForNetworkIdle(timeoutMs: number = 2000): Promise<void> {
-    const start = performance.now();
-    return new Promise((resolve) => {
-      const check = () => {
-        const networkIdle = this.pendingNetworkRequests <= 0;
-        const settledWindowElapsed = performance.now() - this.lastNetworkActivityAt > 120;
-        if (networkIdle && settledWindowElapsed) return resolve();
-        if (performance.now() - start > timeoutMs) return resolve();
-        setTimeout(check, 50);
-      };
-      check();
+  private async executeChange(event: RecordedEvent): Promise<boolean> {
+    if (event.type !== 'Change') return false;
+    const payload = event.payload as ChangePayload;
+    const element = await this.findElement(payload);
+    if (!element) return this.reportMissingTarget(event, payload, 'Change');
+    if (isFormControl(element)) setNativeProp(element, 'value', payload.value);
+    return false;
+  }
+
+  private async executeSubmit(event: RecordedEvent): Promise<boolean> {
+    if (event.type !== 'Submit') return false;
+    const payload = event.payload as SubmitPayload;
+    const element = await this.findElement(payload);
+    if (!element) return this.reportMissingTarget(event, payload, 'Submit');
+
+    const form = element instanceof HTMLFormElement ? element : element.closest('form');
+    if (!form) return false;
+
+    const accepted = form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    if (accepted) {
+      try {
+        form.requestSubmit?.();
+      } catch {
+        /* requestSubmit is unavailable in some embedders */
+      }
+    }
+    await this.settle(event, 1800, 'submit');
+    return false;
+  }
+
+  private async executeKey(event: RecordedEvent): Promise<boolean> {
+    if (event.type !== 'Key') return false;
+    const payload = event.payload as KeyPayload;
+    const target = (document.activeElement as HTMLElement | null) ?? document.body;
+    if (!target) return false;
+
+    const init: KeyboardEventInit = {
+      key: payload.key,
+      code: payload.code,
+      altKey: Boolean(payload.altKey),
+      ctrlKey: Boolean(payload.ctrlKey),
+      metaKey: Boolean(payload.metaKey),
+      shiftKey: Boolean(payload.shiftKey),
+      bubbles: true,
+      cancelable: true,
+    };
+    // Legacy sessions carry no `kind`; fall back to the old both-edges behaviour.
+    const kind = payload.kind;
+    if (kind === 'down' || kind === undefined) target.dispatchEvent(new KeyboardEvent('keydown', init));
+    if (kind === 'up' || kind === undefined) target.dispatchEvent(new KeyboardEvent('keyup', init));
+    return false;
+  }
+
+  private async executeScroll(event: RecordedEvent): Promise<boolean> {
+    if (event.type !== 'Scroll') return false;
+    const payload = event.payload as ScrollPayload;
+
+    if (payload.selector === 'window') {
+      window.scrollTo(payload.scrollLeft, payload.scrollTop);
+      return false;
+    }
+
+    const element = await this.findElement(payload, 800);
+    if (!element) return false;
+    element.scrollTop = payload.scrollTop;
+    element.scrollLeft = payload.scrollLeft;
+    element.dispatchEvent(new Event('scroll', { bubbles: true }));
+    return false;
+  }
+
+  private async executeNavigation(event: RecordedEvent): Promise<boolean> {
+    if (event.type !== 'Navigation') return false;
+    const payload = event.payload as NavigationPayload;
+    const type = payload.navigationType ?? 'navigate';
+
+    if (type === 'back') {
+      window.history.back();
+      return true;
+    }
+    if (type === 'forward') {
+      window.history.forward();
+      return true;
+    }
+    // Same normalisation as everywhere else; the old inline variant kept the
+    // hash and so re-navigated on every in-page anchor change.
+    if (normalizeUrl(window.location.href) === normalizeUrl(payload.url)) return false;
+
+    console.info('[ReplayX Replayer] Navigating to', payload.url);
+    window.location.assign(payload.url);
+    return true;
+  }
+
+  private async executeFocusChange(event: RecordedEvent): Promise<boolean> {
+    if (event.type !== 'Focus' && event.type !== 'Blur') return false;
+    const payload = event.payload as FocusPayload | BlurPayload;
+    const element = await this.findElement(payload, 800);
+    if (!element) return false;
+    if (event.type === 'Focus') element.focus();
+    else element.blur();
+    return false;
+  }
+
+  private reportMissingTarget(event: RecordedEvent, payload: TargetPayload, label: string): boolean {
+    this.recordError(
+      event,
+      'target_not_found',
+      `${label} target was not found`,
+      'The recorded selector could not be resolved during replay. The element may have changed, moved, or not yet rendered.',
+      'find',
+      {
+        retryable: true,
+        severity: 'error',
+        selector: payload.selector,
+        targetTag: payload.targetTag,
+        expected: 'An element matching the recorded selector',
+        actual: 'No matching element could be resolved during replay',
+      },
+    );
+    return false;
+  }
+
+  // -------------------------------------------------------------------------
+  // Settling and mismatch detection
+  // -------------------------------------------------------------------------
+
+  /**
+   * Waits for network and DOM quiescence, then judges the outcome once.
+   *
+   * The previous implementation compared snapshots *inside* the wait loop and
+   * flagged a mismatch whenever the DOM had not yet changed - which on the
+   * first 50ms tick is true for essentially every interaction. That both
+   * flooded the report with false positives and aborted settling immediately,
+   * defeating the whole purpose of the wait.
+   */
+  private async settle(event: RecordedEvent, timeoutMs: number, kind: string): Promise<void> {
+    const before = this.fingerprint();
+    const deadline = performance.now() + timeoutMs;
+
+    while (performance.now() < deadline) {
+      await sleep(50);
+      const networkIdle =
+        this.pendingNetworkRequests <= 0 && performance.now() - this.lastNetworkActivityAt > 120;
+      const domIdle = performance.now() - this.lastDomMutationAt > 120;
+      if (document.readyState === 'complete' && networkIdle && domIdle) break;
+    }
+
+    if (kind === 'navigation') return;
+    // Only interactions the *recording* showed producing a DOM change can
+    // meaningfully be reported as producing none.
+    if (!this.eventsExpectingDomChange.has(event.id)) return;
+
+    const after = this.fingerprint();
+    if (!fingerprintsDiffer(before, after)) {
+      this.recordError(
+        event,
+        'dom_mismatch',
+        'Replay produced no observable DOM change after the interaction.',
+        `The original recording showed the DOM updating after this ${kind}, but replay left it unchanged.`,
+        'settle',
+        {
+          retryable: true,
+          severity: 'warning',
+          expected: 'A DOM transition matching the recorded session',
+          actual: `DOM unchanged (${after.elements} elements, ${after.textLength} chars of text)`,
+        },
+      );
+    }
+  }
+
+  /** O(nodes) with no string allocation, unlike serialising `document.body.innerHTML`. */
+  fingerprint(): DomFingerprint {
+    const body = document.body;
+    if (!body) return { elements: 0, textLength: 0, structure: 0 };
+
+    let elements = 0;
+    let structure = 0;
+    const walker = document.createTreeWalker(body, NodeFilter.SHOW_ELEMENT);
+    let node = walker.nextNode() as Element | null;
+    while (node) {
+      if (!node.hasAttribute(REPLAYX_UI_ATTR)) {
+        elements += 1;
+        // Cheap order-sensitive rolling hash of the tag sequence.
+        structure = (structure * 31 + node.tagName.length + node.childElementCount) >>> 0;
+      }
+      node = walker.nextNode() as Element | null;
+    }
+
+    return { elements, textLength: (body.textContent ?? '').length, structure };
+  }
+
+  private setupDomStabilityObserver(): void {
+    if (this.domStabilityObserver || !document.body || typeof MutationObserver === 'undefined') return;
+    this.domStabilityObserver = new MutationObserver((mutations) => {
+      // Our own cursor moves constantly; counting it would make the DOM look
+      // permanently unstable and every settle would run to timeout.
+      if (mutations.every((m) => (m.target as Element)?.closest?.(`[${REPLAYX_UI_ATTR}]`))) return;
+      this.domMutationCount += mutations.length;
+      this.lastDomMutationAt = performance.now();
+    });
+    this.domStabilityObserver.observe(document.body, {
+      childList: true,
+      attributes: true,
+      characterData: true,
+      subtree: true,
     });
   }
 
-  private async waitForReplaySettling(timeoutMs: number = 2000, options: { eventType?: string } = {}): Promise<void> {
-    const effectiveTimeout = Math.max(timeoutMs, options.eventType === 'navigation' ? 2500 : 1200);
-    await this.waitForNetworkIdle(effectiveTimeout);
+  private disconnectDomStabilityObserver(): void {
+    this.domStabilityObserver?.disconnect();
+    this.domStabilityObserver = null;
+  }
 
-    const startedAt = performance.now();
-    const initialDomSnapshot = this.captureDomSnapshot();
-    while (performance.now() - startedAt < effectiveTimeout) {
-      await this.delayMs(50);
-      const domSettled = this.domMutationCount === 0 || performance.now() - this.lastDomMutationAt > 120;
-      const networkSettled = this.pendingNetworkRequests === 0 || performance.now() - this.lastNetworkActivityAt > 120;
-      const currentDomSnapshot = this.captureDomSnapshot();
-      const mismatch = this.detectDomMismatch(initialDomSnapshot, currentDomSnapshot, { eventType: options.eventType || 'interaction' });
-      if (mismatch.hasMismatch) {
-        this.recordReplayError({
-          id: `mismatch-${Date.now()}`,
-          sessionId: this.session?.id || 'unknown',
-          type: 'Mutation',
-          timestamp: Date.now(),
-          payload: {}
-        } as RecordedEvent, 'dom_mismatch', mismatch.message, mismatch.details, 'settle', currentDomSnapshot, {
-          retryable: true,
-          severity: 'warning',
-          expected: mismatch.expected,
-          actual: mismatch.actual
-        });
-        break;
+  // -------------------------------------------------------------------------
+  // Element resolution
+  // -------------------------------------------------------------------------
+
+  private async findElement(target: TargetPayload, timeoutMs = FIND_TIMEOUT_MS): Promise<HTMLElement | null> {
+    const candidates = buildCandidates(target);
+    const deadline = performance.now() + timeoutMs;
+    let delay = 25;
+
+    for (;;) {
+      const found = this.resolveCandidates(candidates, target.textSnippet);
+      if (found) return found;
+      if (performance.now() >= deadline) return null;
+      await sleep(delay);
+      // Back off instead of hammering a 100ms poll for the full timeout.
+      delay = Math.min(delay * 2, 250);
+    }
+  }
+
+  private resolveCandidates(candidates: string[], textSnippet?: string): HTMLElement | null {
+    for (const selector of candidates) {
+      const element = this.querySelectorDeep(selector);
+      if (element && this.isUsable(element)) return element;
+    }
+    if (textSnippet) {
+      const byText = this.findByText(textSnippet);
+      if (byText) return byText;
+    }
+    return null;
+  }
+
+  /**
+   * Light DOM first, shadow roots only if the page actually has any. The
+   * previous version walked every element in the document on every attempt,
+   * for every candidate selector - O(candidates x nodes) per 100ms tick.
+   */
+  private querySelectorDeep(selector: string, root: ParentNode = document): HTMLElement | null {
+    let direct: Element | null = null;
+    try {
+      direct = root.querySelector(selector);
+    } catch {
+      return null; // malformed selector recorded by an older build
+    }
+    if (direct) return direct as HTMLElement;
+
+    const hosts = root.querySelectorAll('*');
+    for (let i = 0; i < hosts.length; i++) {
+      const shadow = (hosts[i] as Element & { shadowRoot?: ShadowRoot | null }).shadowRoot;
+      if (!shadow) continue;
+      const found = this.querySelectorDeep(selector, shadow);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  private findByText(snippet: string): HTMLElement | null {
+    const needle = snippet.trim().slice(0, 120);
+    if (!needle) return null;
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+    let node = walker.nextNode() as HTMLElement | null;
+    while (node) {
+      if (
+        !node.hasAttribute(REPLAYX_UI_ATTR) &&
+        node.childElementCount === 0 &&
+        (node.textContent ?? '').trim().includes(needle) &&
+        this.isUsable(node)
+      ) {
+        return node;
       }
-      if (document.readyState === 'complete' && domSettled && networkSettled) break;
+      node = walker.nextNode() as HTMLElement | null;
+    }
+    return null;
+  }
+
+  private isUsable(element: HTMLElement): boolean {
+    if (element.hasAttribute(REPLAYX_UI_ATTR)) return false;
+    // Form controls are actionable even when visually collapsed.
+    if (element.matches('input, textarea, select, form, option')) return true;
+    const style = window.getComputedStyle(element);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  // -------------------------------------------------------------------------
+  // Misc
+  // -------------------------------------------------------------------------
+
+  private restoreInitialState(session: SessionData): void {
+    const initial = session.initialState;
+    if (!initial) return;
+    console.info('[ReplayX Replayer] Restoring recorded storage before reload');
+
+    restoreStorage(() => localStorage, initial.localStorage);
+    restoreStorage(() => sessionStorage, initial.sessionStorage);
+
+    writeSession('replayx_active', 'true');
+    writeSession('replayx_event_index', '0');
+    window.location.reload();
+  }
+
+  private createCursor(): void {
+    if (this.cursor || !document.body) return;
+    const cursor = document.createElement('div');
+    cursor.setAttribute(REPLAYX_UI_ATTR, 'cursor');
+    Object.assign(cursor.style, {
+      position: 'fixed',
+      width: '20px',
+      height: '20px',
+      borderRadius: '50%',
+      backgroundColor: 'rgba(255, 0, 0, 0.8)',
+      border: '2px solid #ff0000',
+      zIndex: '2147483647',
+      pointerEvents: 'none',
+      transition: `all ${0.2 / this.state.speed}s ease-out`,
+      boxShadow: '0 0 10px rgba(255, 0, 0, 0.5)',
+    });
+    document.body.appendChild(cursor);
+    this.cursor = cursor;
+  }
+
+  private moveCursorTo(element: HTMLElement): void {
+    if (!this.cursor) return;
+    const rect = element.getBoundingClientRect();
+    this.cursor.style.left = `${rect.left + rect.width / 2 - 10}px`;
+    this.cursor.style.top = `${rect.top + rect.height / 2 - 10}px`;
+  }
+
+  private setInterceptorMode(mode: InterceptorMode, networkEvents?: NetworkMock[]): void {
+    try {
+      window.postMessage({ source: CONTENT_SOURCE, action: 'SET_MODE', mode, networkEvents }, '*');
+    } catch {
+      /* ignore */
     }
   }
 
-  private captureDomSnapshot(): string {
-    return document.body ? document.body.innerHTML.slice(0, 4000) : '';
-  }
-
-  private detectDomMismatch(before: string, after: string, context: { eventType?: string } = {}) {
-    const beforeTrimmed = before.replace(/\s+/g, ' ').trim();
-    const afterTrimmed = after.replace(/\s+/g, ' ').trim();
-
-    if (!beforeTrimmed && !afterTrimmed) {
-      return { hasMismatch: false, message: '', details: '', expected: '', actual: '', code: 'no_change' };
+  private notifyFinished(): void {
+    if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) return;
+    try {
+      chrome.runtime.sendMessage({ action: 'REPLAY_FINISHED', errors: this.replayErrors }, () => {
+        if (chrome.runtime.lastError) {
+          console.warn('[ReplayX Replayer] REPLAY_FINISHED failed:', chrome.runtime.lastError.message);
+        }
+      });
+    } catch (error) {
+      console.warn('[ReplayX Replayer] Could not notify background:', error);
     }
-
-    const changed = beforeTrimmed !== afterTrimmed;
-    const hasMismatch = !changed && context.eventType !== 'navigation';
-
-    return {
-      hasMismatch,
-      code: 'dom_mismatch',
-      message: hasMismatch ? 'Replay produced no observable DOM change after the interaction.' : '',
-      details: hasMismatch ? 'The page did not produce the expected DOM transition after this replay step.' : '',
-      expected: hasMismatch ? 'A DOM transition or state update following the replayed interaction' : '',
-      actual: hasMismatch ? 'DOM remained effectively unchanged after the interaction' : '',
-      target: context.eventType || 'interaction'
-    };
   }
 
-  private recordReplayError(
+  private recordError(
     event: RecordedEvent,
     code: string,
     message: string,
-    details?: string,
-    stage: string = 'playback',
-    domSnippet?: string,
-    context?: Partial<ReplayErrorEntry>
-  ) {
-    const errorEntry: ReplayErrorEntry = {
+    details: string | undefined,
+    stage: string,
+    context: Partial<ReplayErrorEntry> = {},
+  ): void {
+    this.replayErrors.push({
       eventId: event.id,
       eventType: event.type,
       code,
@@ -857,281 +861,143 @@ export class Replayer {
       details,
       stage,
       timestamp: Date.now(),
-      retryable: context?.retryable ?? false,
-      severity: context?.severity ?? 'warning',
-      selector: context?.selector,
-      targetTag: context?.targetTag,
-      expected: context?.expected,
-      actual: context?.actual
-    };
-
-    this.replayErrors.push(errorEntry as any);
-    if (domSnippet) {
-      (this.replayErrors[this.replayErrors.length - 1] as any).dom = domSnippet;
-    }
-  }
-
-  private async executeResize(event: RecordedEvent) {
-    // Resize events are informational, actual resize is handled by browser
-    console.log('[ReplayX Replayer] Resize event:', event.payload);
-  }
-
-  private async executeFocus(event: RecordedEvent) {
-    if (event.type !== 'Focus') return;
-    const payload = event.payload as FocusPayload;
-    let element = await this.findElement({ selector: payload.selector, fallbackSelectors: payload.fallbackSelectors, textSnippet: payload.textSnippet, name: payload.name, dataTestId: payload.dataTestId }) as HTMLElement;
-    if (element) {
-      element.focus();
-    }
-  }
-
-  private async executeBlur(event: RecordedEvent) {
-    if (event.type !== 'Blur') return;
-    const payload = event.payload as BlurPayload;
-    let element = await this.findElement({ selector: payload.selector, fallbackSelectors: payload.fallbackSelectors, textSnippet: payload.textSnippet, name: payload.name, dataTestId: payload.dataTestId }) as HTMLElement;
-    if (element) {
-      element.blur();
-    }
-  }
-
-  private async findElement(selectorOrObj: any, timeoutMs: number = 3000): Promise<HTMLElement | null> {
-    const selector = typeof selectorOrObj === 'string' ? selectorOrObj : selectorOrObj?.selector;
-    const fallbackSelectors: string[] = typeof selectorOrObj === 'object' ? selectorOrObj?.fallbackSelectors || [] : [];
-    const textSnippet = typeof selectorOrObj === 'object' ? selectorOrObj?.textSnippet : undefined;
-    const name = typeof selectorOrObj === 'object' ? selectorOrObj?.name : undefined;
-    const dataTestId = typeof selectorOrObj === 'object' ? selectorOrObj?.dataTestId : undefined;
-    const startTime = performance.now();
-
-    const candidates = [selector, ...fallbackSelectors];
-    if (name) candidates.push(`${selectorOrObj.targetTag || '*'}[name="${name}"]`, `[name="${name}"]`);
-    if (dataTestId) candidates.push(`[data-testid="${dataTestId}"]`, `[data-cy="${dataTestId}"]`, `[data-test="${dataTestId}"]`, `[data-qa="${dataTestId}"]`);
-
-    while (performance.now() - startTime < timeoutMs) {
-      try {
-        for (const candidate of candidates) {
-          if (!candidate) continue;
-          let element = this.querySelectorDeep(candidate);
-          if (!element) {
-            element = this.tryAlternativeSelectors(candidate, textSnippet);
-          }
-          if (element && (this.isElementInteractable(element) || element.matches('input, textarea, select, form'))) {
-            return element;
-          }
-        }
-      } catch (e) {}
-
-      await this.delayMs(100);
-    }
-
-    return null;
-  }
-
-  /**
-   * Shadow-piercing query selector
-   */
-  private querySelectorDeep(selector: string, root: Document | Element | ShadowRoot = document): HTMLElement | null {
-    if (root instanceof Element && root.matches(selector)) return root as HTMLElement;
-
-    const el = (root as Document | Element | ShadowRoot).querySelector(selector) as HTMLElement;
-    if (el) return el;
-
-    const elements = (root as Document).querySelectorAll('*');
-    for (let i = 0; i < elements.length; i++) {
-      const element = elements[i] as any;
-      const shadowRoot = element?.shadowRoot;
-      if (shadowRoot) {
-        const found = this.querySelectorDeep(selector, shadowRoot);
-        if (found) return found;
-      }
-    }
-    return null;
-  }
-
-  /**
-   * Programmatically set property bypassing framework (React/Vue) setter overrides
-   */
-  private setNativeProps(element: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement, prop: 'value' | 'checked', value: any) {
-    const prototype = Object.getPrototypeOf(element);
-    const descriptor = Object.getOwnPropertyDescriptor(prototype, prop);
-    
-    if (descriptor && descriptor.set) {
-      descriptor.set.call(element, value);
-    } else {
-      (element as any)[prop] = value;
-    }
-
-    // Trigger events to notify framework observers
-    element.dispatchEvent(new Event('input', { bubbles: true }));
-    element.dispatchEvent(new Event('change', { bubbles: true }));
-  }
-
-  private tryAlternativeSelectors(originalSelector: string, textSnippet?: string): HTMLElement | null {
-    // Try data attributes
-    const dataAttrs = ['data-testid', 'data-cy', 'data-test'];
-    for (const attr of dataAttrs) {
-      if (originalSelector.includes(`[${attr}`)) {
-        const value = originalSelector.match(new RegExp(`\\[${attr}="([^"]+)"\\]`))?.[1];
-        if (value) {
-          // Fix 3: Use querySelectorDeep for alternative selectors to support Shadow DOM
-          const element = this.querySelectorDeep(`[${attr}="${value}"]`);
-          if (element) return element;
-        }
-      }
-    }
-
-    // Try ID
-    const idMatch = originalSelector.match(/#([^ >]+)/);
-    if (idMatch && idMatch[1]) {
-      const id = idMatch[1];
-      const element = this.querySelectorDeep(`#${id}`);
-      if (element) return element;
-    }
-
-    // Try simplified selector
-    const parts = originalSelector.split(' > ');
-    const lastPart = parts[parts.length - 1]?.split(':')[0];
-    if (!lastPart) return null;
-    let element = this.querySelectorDeep(lastPart);
-    if (element) return element;
-
-    // If we have a text snippet, try matching by tag + text content contains snippet
-    if (textSnippet) {
-      try {
-        const tagMatch = lastPart.match(/^([a-z0-9\-]+)/i);
-        const tag = tagMatch ? tagMatch[1] : null;
-        const candidates = tag ? Array.from(document.querySelectorAll(tag)) : Array.from(document.querySelectorAll('*'));
-        for (const c of candidates) {
-          const el = c as HTMLElement;
-          if (el && (el.textContent || '').includes(textSnippet)) return el;
-        }
-      } catch (e) {}
-    }
-
-    return null;
-  }
-
-  private isElementInteractable(element: HTMLElement): boolean {
-    const style = window.getComputedStyle(element);
-    const rect = element.getBoundingClientRect();
-
-    return style.display !== 'none' &&
-           style.visibility !== 'hidden' &&
-           style.opacity !== '0' &&
-           !element.hasAttribute('disabled') &&
-           rect.width > 0 &&
-           rect.height > 0;
-  }
-
-  private async processAsyncQueues() {
-    if (this.isProcessingQueues) return;
-    this.isProcessingQueues = true;
-
-    // Process microtasks first
-    while (this.microtaskQueue.length > 0) {
-      const task = this.microtaskQueue.shift()!;
-      try {
-        await task();
-      } catch (error) {
-        console.error('[ReplayX Replayer] Microtask error:', error);
-      }
-    }
-
-    // Process macrotasks
-    while (this.macrotaskQueue.length > 0) {
-      const task = this.macrotaskQueue.shift()!;
-      try {
-        await task();
-      } catch (error) {
-        console.error('[ReplayX Replayer] Macrotask error:', error);
-      }
-    }
-
-    this.isProcessingQueues = false;
-  }
-
-  private createCursor() {
-    if (this.cursor) return;
-
-    this.cursor = document.createElement('div');
-    Object.assign(this.cursor.style, {
-      position: 'fixed',
-      width: '20px',
-      height: '20px',
-      borderRadius: '50%',
-      backgroundColor: 'rgba(255, 0, 0, 0.8)',
-      border: '2px solid #ff0000',
-      zIndex: '9999999',
-      pointerEvents: 'none',
-      transition: `all ${0.2 / this.state.speed}s ease-out`,
-      boxShadow: '0 0 10px rgba(255, 0, 0, 0.5)'
-    });
-
-    document.body.appendChild(this.cursor);
-  }
-
-  private moveCursorTo(element: HTMLElement) {
-    if (!this.cursor) return;
-
-    const rect = element.getBoundingClientRect();
-    const x = rect.left + rect.width / 2 - 10;
-    const y = rect.top + rect.height / 2 - 10;
-
-    this.cursor.style.left = `${x}px`;
-    this.cursor.style.top = `${y}px`;
-    this.cursor.style.transform = 'scale(1.2)';
-
-    setTimeout(() => {
-      if (this.cursor) this.cursor.style.transform = 'scale(1)';
-    }, 200);
-  }
-
-  private setupKeyboardControls() {
-    const handler = (e: KeyboardEvent) => {
-      switch (e.key) {
-        case ' ':
-          e.preventDefault();
-          if (this.state.paused) this.resume();
-          else this.pause();
-          break;
-        case 'Escape':
-          e.preventDefault();
-          this.stop();
-          break;
-      }
-    };
-
-    document.addEventListener('keydown', handler);
-
-    // Cleanup on stop
-    const originalStop = this.stop.bind(this);
-    this.stop = (isFinished?: boolean) => {
-      document.removeEventListener('keydown', handler);
-      originalStop(isFinished);
-    };
-  }
-
-  private setupDomStabilityObserver() {
-    if (this.domStabilityObserver || !document.body) return;
-
-    this.domStabilityObserver = new MutationObserver(() => {
-      this.domMutationCount += 1;
-      this.lastDomMutationAt = performance.now();
-    });
-
-    this.domStabilityObserver.observe(document.body, {
-      childList: true,
-      attributes: true,
-      characterData: true,
-      subtree: true
+      retryable: context.retryable ?? false,
+      severity: context.severity ?? 'warning',
+      selector: context.selector,
+      targetTag: context.targetTag,
+      expected: context.expected,
+      actual: context.actual,
     });
   }
+}
 
-  private disconnectDomStabilityObserver() {
-    this.domStabilityObserver?.disconnect();
-    this.domStabilityObserver = null;
-  }
+// ---------------------------------------------------------------------------
+// Pure helpers (exported for unit tests)
+// ---------------------------------------------------------------------------
 
-  private delayMs(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms / this.state.speed));
+export function normalizeUrl(url: string): string {
+  if (!url) return '';
+  const withoutHash = url.split('#')[0] ?? url;
+  return withoutHash.replace(/\/+$/, '').toLowerCase();
+}
+
+export function clampSpeed(speed: number): number {
+  if (!Number.isFinite(speed)) return 1;
+  return Math.max(0.1, Math.min(10, speed));
+}
+
+export function fingerprintsDiffer(a: DomFingerprint, b: DomFingerprint): boolean {
+  return a.elements !== b.elements || a.textLength !== b.textLength || a.structure !== b.structure;
+}
+
+export function buildCandidates(target: TargetPayload): string[] {
+  const candidates: string[] = [];
+  const push = (selector?: string | null) => {
+    if (selector && !candidates.includes(selector)) candidates.push(selector);
+  };
+
+  push(target.selector);
+  for (const fallback of target.fallbackSelectors ?? []) push(fallback);
+  if (target.dataTestId) {
+    push(`[data-testid="${target.dataTestId}"]`);
+    push(`[data-cy="${target.dataTestId}"]`);
+    push(`[data-test="${target.dataTestId}"]`);
+    push(`[data-qa="${target.dataTestId}"]`);
   }
+  if (target.name) {
+    push(`${target.targetTag ?? '*'}[name="${target.name}"]`);
+    push(`[name="${target.name}"]`);
+  }
+  if (target.id) push(`#${target.id}`);
+
+  return candidates;
+}
+
+export function collectNetworkMocks(events: RecordedEvent[]): NetworkMock[] {
+  const mocks: NetworkMock[] = [];
+  for (const event of events) {
+    if (event.type !== 'Network') continue;
+    const payload = event.payload as NetworkPayload;
+    mocks.push({
+      id: event.id,
+      method: payload.method,
+      url: payload.url,
+      requestBody: payload.requestBody,
+      responseStatus: payload.responseStatus,
+      responseHeaders: payload.responseHeaders ?? {},
+      responseBody: payload.responseBody ?? '',
+    });
+  }
+  return mocks;
+}
+
+function isInteraction(type: RecordedEvent['type']): boolean {
+  return type === 'Click' || type === 'DoubleClick' || type === 'Input' || type === 'Submit' || type === 'Change';
+}
+
+function isFormControl(
+  element: Element,
+): element is HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement {
+  return (
+    element instanceof HTMLInputElement ||
+    element instanceof HTMLTextAreaElement ||
+    element instanceof HTMLSelectElement
+  );
+}
+
+/** Bypasses React/Vue value setter interception so frameworks observe the change. */
+function setNativeProp(
+  element: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement,
+  prop: 'value' | 'checked',
+  value: string | boolean,
+): void {
+  const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), prop);
+  if (descriptor?.set) descriptor.set.call(element, value);
+  else (element as unknown as Record<string, unknown>)[prop] = value;
+  element.dispatchEvent(new Event('input', { bubbles: true }));
+  element.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function restoreStorage(get: () => Storage, values: Record<string, string> | undefined): void {
+  if (!values) return;
+  try {
+    const storage = get();
+    // Only recorded keys are touched, so unrelated user data survives.
+    for (const key of Object.keys(values)) storage.removeItem(key);
+    for (const [key, value] of Object.entries(values)) storage.setItem(key, value);
+  } catch (error) {
+    console.warn('[ReplayX Replayer] Storage restore failed:', error);
+  }
+}
+
+function readSession(key: string): string | null {
+  try {
+    return sessionStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeSession(key: string, value: string): void {
+  try {
+    sessionStorage.setItem(key, value);
+  } catch {
+    /* storage may be unavailable on opaque origins */
+  }
+}
+
+function removeSession(key: string): void {
+  try {
+    sessionStorage.removeItem(key);
+  } catch {
+    /* ignore */
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
