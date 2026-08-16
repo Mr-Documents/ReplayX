@@ -61,18 +61,34 @@ export class Recorder {
 
   private readonly limits: RecorderLimits;
 
-  private readonly onClickBound = (e: Event) => this.onClick(e as MouseEvent, false);
-  private readonly onDblClickBound = (e: Event) => this.onClick(e as MouseEvent, true);
-  private readonly onInputBound = (e: Event) => this.onInput(e);
-  private readonly onChangeBound = (e: Event) => this.onChange(e);
-  private readonly onSubmitBound = (e: Event) => this.onSubmit(e);
-  private readonly onScrollBound = (e: Event) => this.onScroll(e);
-  private readonly onResizeBound = () => this.onResize();
-  private readonly onFocusBound = (e: Event) => this.onFocusChange(e, 'Focus');
-  private readonly onBlurBound = (e: Event) => this.onFocusChange(e, 'Blur');
-  private readonly onKeyDownBound = (e: Event) => this.onKey(e as KeyboardEvent, 'down');
-  private readonly onKeyUpBound = (e: Event) => this.onKey(e as KeyboardEvent, 'up');
-  private readonly onNavigationBound = (e: Event) => this.onNavigation(e);
+  /**
+   * These are capture-phase listeners on the host page's document. An exception
+   * escaping one of them surfaces as an error in the page's own console and
+   * loses the event, so recording failures are contained here instead: a broken
+   * capture costs one event, never the page.
+   */
+  private guard<A extends unknown[]>(name: string, handler: (...args: A) => void): (...args: A) => void {
+    return (...args: A) => {
+      try {
+        handler(...args);
+      } catch (error) {
+        console.warn(`[ReplayX Recorder] ${name} handler failed:`, error);
+      }
+    };
+  }
+
+  private readonly onClickBound = this.guard('click', (e: Event) => this.onClick(e as MouseEvent, false));
+  private readonly onDblClickBound = this.guard('dblclick', (e: Event) => this.onClick(e as MouseEvent, true));
+  private readonly onInputBound = this.guard('input', (e: Event) => this.onInput(e));
+  private readonly onChangeBound = this.guard('change', (e: Event) => this.onChange(e));
+  private readonly onSubmitBound = this.guard('submit', (e: Event) => this.onSubmit(e));
+  private readonly onScrollBound = this.guard('scroll', (e: Event) => this.onScroll(e));
+  private readonly onResizeBound = this.guard('resize', () => this.onResize());
+  private readonly onFocusBound = this.guard('focus', (e: Event) => this.onFocusChange(e, 'Focus'));
+  private readonly onBlurBound = this.guard('blur', (e: Event) => this.onFocusChange(e, 'Blur'));
+  private readonly onKeyDownBound = this.guard('keydown', (e: Event) => this.onKey(e as KeyboardEvent, 'down'));
+  private readonly onKeyUpBound = this.guard('keyup', (e: Event) => this.onKey(e as KeyboardEvent, 'up'));
+  private readonly onNavigationBound = this.guard('navigation', (e: Event) => this.onNavigation(e));
 
   constructor(limits: Partial<RecorderLimits> = {}) {
     this.limits = { ...DEFAULT_LIMITS, ...limits };
@@ -439,13 +455,15 @@ export class Recorder {
     this.originalPushState = originalPush;
     this.originalReplaceState = originalReplace;
 
+    // The page's own call must succeed and return normally even if our capture
+    // fails: an exception here would propagate into the site's router.
     const pushState: History['pushState'] = (...args) => {
       originalPush.apply(history, args);
-      this.onNavigation({ type: 'pushstate' } as Event);
+      this.onNavigationBound({ type: 'pushstate' } as Event);
     };
     const replaceState: History['replaceState'] = (...args) => {
       originalReplace.apply(history, args);
-      this.onNavigation({ type: 'replacestate' } as Event);
+      this.onNavigationBound({ type: 'replacestate' } as Event);
     };
 
     (pushState as typeof patched)._replayxPatched = true;
@@ -467,21 +485,27 @@ export class Recorder {
 
     this.mutationObserver = new MutationObserver((mutations) => {
       for (const mutation of mutations) {
-        const target = mutation.target as Element;
-        // Our own widget and replay cursor must not pollute the recording.
-        if (isReplayXNode(target)) continue;
-        if (!this.allowMutation()) return;
+        // Guarded per mutation: one unserialisable node must not discard the
+        // rest of the batch.
+        try {
+          const target = mutation.target as Element;
+          // Our own widget and replay cursor must not pollute the recording.
+          if (isReplayXNode(target)) continue;
+          if (!this.allowMutation()) return;
 
-        const payload = this.describeMutation(mutation, target);
-        if (!payload) continue;
+          const payload = this.describeMutation(mutation, target);
+          if (!payload) continue;
 
-        this.addEvent({
-          id: generateId(),
-          sessionId: this.sessionId,
-          timestamp: this.timestamp(),
-          type: 'Mutation',
-          payload,
-        } as RecordedEvent);
+          this.addEvent({
+            id: generateId(),
+            sessionId: this.sessionId,
+            timestamp: this.timestamp(),
+            type: 'Mutation',
+            payload,
+          } as RecordedEvent);
+        } catch (error) {
+          console.warn('[ReplayX Recorder] Skipped an unrecordable mutation:', error);
+        }
       }
     });
 

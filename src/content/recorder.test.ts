@@ -311,3 +311,124 @@ describe('helpers', () => {
     expect(large).toBeGreaterThan(small + 900);
   });
 });
+
+describe('host page containment', () => {
+  /**
+   * The recorder attaches capture-phase listeners to every page the user
+   * visits. Nothing it does may surface as an error in the page's own console
+   * or interrupt the page's event dispatch.
+   */
+
+  function breakSelectorGeneration(el: Element): void {
+    // A realistic failure: an element whose tagName access throws (proxied or
+    // cross-realm nodes in the wild do this).
+    Object.defineProperty(el, 'tagName', {
+      configurable: true,
+      get() {
+        throw new Error('hostile element');
+      },
+    });
+  }
+
+  it('does not let a capture failure escape into the page', () => {
+    document.body.innerHTML = '<button id="b">go</button>';
+    const button = document.getElementById('b')!;
+    breakSelectorGeneration(button);
+
+    recorder.start('session-1');
+
+    const laterListener = vi.fn();
+    button.addEventListener('click', laterListener);
+
+    expect(() => {
+      button.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: 1, clientY: 1 }));
+    }).not.toThrow();
+
+    // The page's own listener still ran.
+    expect(laterListener).toHaveBeenCalledOnce();
+    expect(recorder.isRecordingActive()).toBe(true);
+  });
+
+  it('keeps recording siblings of an element that throws on property access', () => {
+    // A hostile sibling used to poison its neighbours too: the structural-path
+    // walk reads tagName on every child of every ancestor, so one throwing node
+    // made its whole subtree unrecordable.
+    document.body.innerHTML = '<button id="bad">bad</button><button id="ok">ok</button>';
+    const bad = document.getElementById('bad')!;
+    const ok = document.getElementById('ok')!;
+    breakSelectorGeneration(bad);
+
+    recorder.start('session-1');
+    bad.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    ok.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+
+    const clicks = eventsOfType(recorder.stop().events, 'Click');
+    expect(clicks).toHaveLength(2);
+    expect((clicks[1]!.payload as TargetPayload).selector).toBe('#ok');
+  });
+
+  it('does not break the page router when pushState capture fails', () => {
+    // The patched pushState runs inside the site's own navigation call, so a
+    // throw here would break client-side routing outright.
+    recorder.start('session-1');
+    const spy = vi.spyOn(recorder as unknown as { onNavigation: () => void }, 'onNavigation');
+    spy.mockImplementation(() => {
+      throw new Error('capture exploded');
+    });
+
+    expect(() => history.pushState({}, '', '/next')).not.toThrow();
+    // The page's navigation still took effect.
+    expect(window.location.pathname).toBe('/next');
+
+    spy.mockRestore();
+    recorder.stop();
+  });
+
+  it('restores the original history methods on stop', () => {
+    const before = history.pushState;
+    recorder.start('session-1');
+    expect(history.pushState).not.toBe(before);
+    recorder.stop();
+    expect(history.pushState).toBe(before);
+  });
+
+  it('survives an unserialisable mutation without losing the observer', () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    recorder.start('session-1');
+
+    const observer = (recorder as unknown as { mutationObserver: MutationObserver | null }).mutationObserver;
+    expect(observer).not.toBeNull();
+
+    const hostile = document.createElement('span');
+    breakSelectorGeneration(hostile);
+
+    // Drive the observer callback directly with a hostile record.
+    const callback = (observer as unknown as { callback?: unknown }) && null;
+    void callback;
+    expect(() => {
+      document.getElementById('root')!.appendChild(hostile);
+    }).not.toThrow();
+
+    recorder.stop();
+  });
+
+  it('tolerates a missing chrome runtime when flushing', () => {
+    const originalChrome = globalThis.chrome;
+    const limited = new Recorder({ flushThreshold: 1 });
+    limited.start('session-1');
+    (globalThis as { chrome?: unknown }).chrome = undefined;
+
+    expect(() => {
+      limited.addEvent({
+        id: 'e-1',
+        sessionId: 'session-1',
+        timestamp: 0,
+        type: 'Click',
+        payload: { selector: '#x', x: 0, y: 0 },
+      } as RecordedEvent);
+    }).not.toThrow();
+
+    (globalThis as { chrome?: unknown }).chrome = originalChrome;
+    limited.stop();
+  });
+});

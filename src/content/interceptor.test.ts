@@ -395,3 +395,147 @@ describe('pure helpers', () => {
     expect(await extractRequestBody('/x')).toBeUndefined();
   });
 });
+
+describe('host page containment', () => {
+  /**
+   * These hooks sit in front of every request the page makes. Shipping a throw
+   * here is how the extension previously broke XHR across the whole web, so the
+   * invariant is absolute: the native call always goes through.
+   */
+
+  /** A url object whose stringification throws, as exotic host objects can. */
+  const hostileUrl = () =>
+    ({
+      toString() {
+        throw new Error('hostile url');
+      },
+    }) as unknown as URL;
+
+  it('still opens the request when tracking throws', () => {
+    const original = vi.fn();
+    const proto = XMLHttpRequest.prototype as unknown as { open: unknown };
+    const saved = proto.open;
+    proto.open = original;
+
+    handle = installInterceptor(window);
+    const xhr = new XMLHttpRequest();
+    const url = hostileUrl();
+
+    expect(() => xhr.open('GET', url)).not.toThrow();
+    // The page's call reached the native implementation untouched.
+    expect(original).toHaveBeenCalledWith('GET', url);
+
+    handle.uninstall();
+    proto.open = saved;
+  });
+
+  it('still sets the header when tracking throws', () => {
+    const original = vi.fn();
+    const proto = XMLHttpRequest.prototype as unknown as { setRequestHeader: unknown };
+    const saved = proto.setRequestHeader;
+    proto.setRequestHeader = original;
+
+    handle = installInterceptor(window);
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', '/x');
+
+    expect(() => xhr.setRequestHeader('Accept', 'application/json')).not.toThrow();
+    expect(original).toHaveBeenCalledWith('Accept', 'application/json');
+
+    handle.uninstall();
+    proto.setRequestHeader = saved;
+  });
+
+  it('still sends when the request body cannot be serialised', () => {
+    const original = vi.fn();
+    const proto = XMLHttpRequest.prototype as unknown as { send: unknown };
+    const saved = proto.send;
+    proto.send = original;
+
+    handle = installInterceptor(window);
+    setMode('RECORD');
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/x');
+    const hostileBody = {
+      toString() {
+        throw new Error('hostile body');
+      },
+    } as unknown as XMLHttpRequestBodyInit;
+
+    expect(() => xhr.send(hostileBody)).not.toThrow();
+    expect(original).toHaveBeenCalledWith(hostileBody);
+
+    handle.uninstall();
+    proto.send = saved;
+  });
+
+  it('is fully transparent to send while idle', () => {
+    const original = vi.fn();
+    const proto = XMLHttpRequest.prototype as unknown as { send: unknown };
+    const saved = proto.send;
+    proto.send = original;
+
+    handle = installInterceptor(window);
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', '/x');
+    xhr.send();
+
+    expect(original).toHaveBeenCalledOnce();
+
+    handle.uninstall();
+    proto.send = saved;
+  });
+
+  it('does not settle an unmocked XHR before its real response arrives', () => {
+    const proto = XMLHttpRequest.prototype as unknown as { send: unknown };
+    const saved = proto.send;
+    proto.send = vi.fn();
+
+    const posted = vi.spyOn(window, 'postMessage');
+    handle = installInterceptor(window);
+    setMode('REPLAY', []);
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', 'https://example.com/unmocked');
+    xhr.send();
+
+    const midFlight = posted.mock.calls.map(([m]) => (m as { action?: string })?.action);
+    expect(midFlight).toContain('NETWORK_REQUEST_STARTED');
+    expect(midFlight).not.toContain('NETWORK_REQUEST_FINISHED');
+
+    // The real response arriving is what settles it.
+    Object.defineProperty(xhr, 'status', { configurable: true, value: 200 });
+    xhr.dispatchEvent(new Event('loadend'));
+
+    const after = posted.mock.calls.map(([m]) => (m as { action?: string })?.action);
+    expect(after).toContain('NETWORK_REQUEST_FINISHED');
+
+    handle.uninstall();
+    proto.send = saved;
+  });
+
+  it('reports a failed pass-through XHR as failed, not finished', () => {
+    const proto = XMLHttpRequest.prototype as unknown as { send: unknown };
+    const saved = proto.send;
+    proto.send = vi.fn();
+
+    const posted = vi.spyOn(window, 'postMessage');
+    handle = installInterceptor(window);
+    setMode('REPLAY', []);
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', 'https://example.com/unmocked');
+    xhr.send();
+    // status 0 is an abort, timeout, or network/CORS failure.
+    Object.defineProperty(xhr, 'status', { configurable: true, value: 0 });
+    xhr.dispatchEvent(new Event('loadend'));
+
+    const actions = posted.mock.calls.map(([m]) => (m as { action?: string })?.action);
+    expect(actions).toContain('NETWORK_REQUEST_FAILED');
+    expect(actions).not.toContain('NETWORK_REQUEST_FINISHED');
+
+    handle.uninstall();
+    proto.send = saved;
+  });
+});

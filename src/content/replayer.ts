@@ -144,7 +144,20 @@ export class Replayer {
     this.scheduleEvents(session.events, options.resumeIndex);
 
     this.state.isPlaying = true;
-    void this.replayLoop();
+    // The loop owns the rest of the replay; if it ever rejects, stop cleanly and
+    // report rather than leaving an unhandled rejection on the page.
+    this.replayLoop().catch((error: unknown) => {
+      console.error('[ReplayX Replayer] Replay loop crashed:', error);
+      this.replayErrors.push({
+        code: 'event_failed',
+        message: 'Replay stopped unexpectedly',
+        details: error instanceof Error ? error.message : String(error),
+        stage: 'loop',
+        severity: 'error',
+        timestamp: Date.now(),
+      });
+      this.stop(true);
+    });
   }
 
   stop(isFinished = false): void {

@@ -118,7 +118,11 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     if (current.recording?.tabId === tabId) patch.recording = null;
     if (current.replay?.tabId === tabId) patch.replay = null;
     if (Object.keys(patch).length > 0) await state.patch(patch);
-  })();
+  })().catch((error: unknown) => {
+    // Listeners have no caller to reject to, so an unhandled rejection here
+    // would surface as a service-worker error with no context.
+    console.error('[ReplayX BG] Tab cleanup failed:', error);
+  });
 });
 
 chrome.runtime.onInstalled.addListener(() => {

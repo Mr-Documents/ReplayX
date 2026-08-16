@@ -118,7 +118,12 @@ if (document.readyState === 'loading') {
 
 function startReplay(session: SessionData, speed: number, isResume: boolean, resumeIndex: number): void {
   setWidgetState('replaying');
-  void replayer.start(session, { speed: speed || 1, isResume, resumeIndex });
+  // Floating promises in a content script surface as unhandled rejections in
+  // the host page's console, so every one is terminated with a catch.
+  replayer.start(session, { speed: speed || 1, isResume, resumeIndex }).catch((error: unknown) => {
+    console.error('[ReplayX] Replay failed to start:', error);
+    setWidgetState('idle');
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -193,7 +198,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         return false;
 
       case 'STEP_REPLAY':
-        void replayer.step();
+        replayer.step().catch((error: unknown) => {
+          console.error('[ReplayX] Replay step failed:', error);
+        });
         sendResponse({ success: true });
         return false;
 

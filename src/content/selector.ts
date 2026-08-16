@@ -28,6 +28,21 @@ export function cssEscape(value: string): string {
   return value.replace(/[^a-zA-Z0-9_-]/g, (char) => `\\${char}`);
 }
 
+/**
+ * Reads `tagName` without trusting it. Proxied, cross-realm, and custom
+ * elements can throw on property access, and the sibling walk in
+ * `getStructuralPath` touches every child of every ancestor - so one hostile
+ * node would otherwise make its entire subtree unrecordable.
+ */
+function safeTagName(el: Element): string {
+  try {
+    const tag = el.tagName;
+    return typeof tag === 'string' ? tag : '';
+  } catch {
+    return '';
+  }
+}
+
 export function isReplayXNode(node: Node | null): boolean {
   if (!node) return false;
   const element =
@@ -73,7 +88,8 @@ export function getStructuralPath(el: Element): string {
   let current: Element | null = el;
 
   while (current && current.nodeType === Node.ELEMENT_NODE) {
-    const tag = current.tagName.toLowerCase();
+    const tag = safeTagName(current).toLowerCase();
+    if (!tag) break;
     if (tag === 'html') {
       parts.unshift(tag);
       break;
@@ -83,8 +99,11 @@ export function getStructuralPath(el: Element): string {
       parts.unshift(tag);
       break;
     }
-    const siblings = Array.from(parent.children).filter((child) => child.tagName === current!.tagName);
-    parts.unshift(siblings.length > 1 ? `${tag}:nth-of-type(${siblings.indexOf(current) + 1})` : tag);
+    // Bound to a local so the closure keeps the loop's non-null narrowing.
+    const node = current;
+    const nodeTag = safeTagName(node);
+    const siblings = Array.from(parent.children).filter((child) => safeTagName(child) === nodeTag);
+    parts.unshift(siblings.length > 1 ? `${tag}:nth-of-type(${siblings.indexOf(node) + 1})` : tag);
     current = parent;
   }
 
@@ -104,7 +123,7 @@ export function getRobustSelector(el: Element, root: ParentNode = document): str
     if (isUnique(selector, el, root)) return selector;
   }
 
-  const tag = el.tagName.toLowerCase();
+  const tag = safeTagName(el).toLowerCase();
 
   const name = el.getAttribute('name');
   if (name) {
@@ -134,7 +153,7 @@ export function getFallbackSelectors(el: Element, primary: string): string[] {
   const id = el.getAttribute('id');
   if (id) push(`#${cssEscape(id)}`);
 
-  const tag = el.tagName.toLowerCase();
+  const tag = safeTagName(el).toLowerCase();
   const name = el.getAttribute('name');
   if (name) {
     push(`${tag}[name="${cssEscape(name)}"]`);
@@ -166,7 +185,7 @@ export function buildTargetPayload(el: Element, root: ParentNode = document): Ta
     id: el.getAttribute('id') || undefined,
     name: el.getAttribute('name') || undefined,
     dataTestId,
-    targetTag: el.tagName.toLowerCase(),
+    targetTag: safeTagName(el).toLowerCase(),
     textSnippet: (el.textContent || '').trim().slice(0, 120) || undefined,
   };
 }

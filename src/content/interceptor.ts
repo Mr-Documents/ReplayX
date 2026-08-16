@@ -257,27 +257,42 @@ export function installInterceptor(win: Window & typeof globalThis = window): In
   }
   const xhrRecords = new WeakMap<XMLHttpRequest, XhrRecord>();
 
+  /**
+   * Bookkeeping around the native XHR methods is always best-effort. These hooks
+   * sit in front of every request the page makes, so the original call has to go
+   * through even if our own tracking fails - a throw here would break the page's
+   * networking outright, which is precisely the failure this interceptor once
+   * shipped with.
+   */
   XHR.prototype.open = function (
     this: XMLHttpRequest,
     method: string,
     url: string | URL,
     ...rest: unknown[]
   ) {
-    xhrRecords.set(this, {
-      method: String(method || 'GET').toUpperCase(),
-      url: typeof url === 'string' ? url : String(url),
-      requestHeaders: {},
-      startedAt: Date.now(),
-      startedPerf: now(),
-    });
+    try {
+      xhrRecords.set(this, {
+        method: String(method || 'GET').toUpperCase(),
+        url: typeof url === 'string' ? url : String(url),
+        requestHeaders: {},
+        startedAt: Date.now(),
+        startedPerf: now(),
+      });
+    } catch (error) {
+      console.warn('[ReplayX] Could not track XHR open:', error);
+    }
     // The previous implementation forwarded only `rest`, dropping `method` and
     // `url` entirely, which broke every XHR on every page the extension touched.
     return (originalOpen as (...args: unknown[]) => void).call(this, method, url, ...rest);
   } as typeof XHR.prototype.open;
 
   XHR.prototype.setRequestHeader = function (this: XMLHttpRequest, header: string, value: string) {
-    const record = xhrRecords.get(this);
-    if (record) record.requestHeaders[header] = value;
+    try {
+      const record = xhrRecords.get(this);
+      if (record) record.requestHeaders[header] = value;
+    } catch (error) {
+      console.warn('[ReplayX] Could not track XHR header:', error);
+    }
     return originalSetRequestHeader.call(this, header, value);
   };
 
@@ -285,21 +300,36 @@ export function installInterceptor(win: Window & typeof globalThis = window): In
     const record = xhrRecords.get(this);
     if (!record || mode === 'IDLE') return originalSend.call(this, body ?? null);
 
-    record.requestBody = stringifyXhrBody(body);
-    record.startedAt = Date.now();
-    record.startedPerf = now();
     const requestId = `xhr-${++requestCounter}`;
+    try {
+      record.requestBody = stringifyXhrBody(body);
+      record.startedAt = Date.now();
+      record.startedPerf = now();
+    } catch (error) {
+      // An unreadable body must not stop the page from sending the request.
+      console.warn('[ReplayX] Could not read XHR body:', error);
+    }
 
     if (mode === 'REPLAY') {
       lifecycle('NETWORK_REQUEST_STARTED', requestId);
-      const mock = findMatchingNetworkEvent(record.method, record.url, record.requestBody);
+      let mock;
+      try {
+        mock = findMatchingNetworkEvent(record.method, record.url, record.requestBody);
+      } catch (error) {
+        console.warn('[ReplayX] Mock lookup failed:', error);
+      }
+
       if (mock) {
         post({ action: 'MOCK_CONSUMED', id: mock.id });
         mockXhrResponse(this, mock, () => lifecycle('NETWORK_REQUEST_FINISHED', requestId));
         return undefined;
       }
+
+      // Unmocked requests still go to the network, so settle on the real
+      // response rather than immediately - signalling FINISHED here let the
+      // replayer treat the network as idle mid-flight.
       console.warn(`[ReplayX] No mock for XHR ${record.method} ${record.url}; passing through`);
-      lifecycle('NETWORK_REQUEST_FINISHED', requestId);
+      settleOnLoadEnd(this, requestId);
       return originalSend.call(this, body ?? null);
     }
 
@@ -309,6 +339,15 @@ export function installInterceptor(win: Window & typeof globalThis = window): In
     captureOnLoadEnd(this, record, requestId);
     return originalSend.call(this, body ?? null);
   };
+
+  /** Settles a pass-through request without recording it. */
+  function settleOnLoadEnd(xhr: XMLHttpRequest, requestId: string): void {
+    const onLoadEnd = () => {
+      xhr.removeEventListener('loadend', onLoadEnd);
+      lifecycle(xhr.status === 0 ? 'NETWORK_REQUEST_FAILED' : 'NETWORK_REQUEST_FINISHED', requestId);
+    };
+    xhr.addEventListener('loadend', onLoadEnd);
+  }
 
   function captureOnLoadEnd(xhr: XMLHttpRequest, record: XhrRecord, requestId: string): void {
     const onLoadEnd = () => {
