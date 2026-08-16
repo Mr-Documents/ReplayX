@@ -48,6 +48,8 @@ export interface DomFingerprint {
   elements: number;
   textLength: number;
   structure: number;
+  /** Class and state-attribute signature; toggles are invisible to the rest. */
+  attributes: number;
 }
 
 export class Replayer {
@@ -659,6 +661,10 @@ export class Replayer {
         {
           retryable: true,
           severity: 'warning',
+          // Without the target this finding named no element at all, so there
+          // was nothing for the user to go and look at.
+          selector: (event.payload as Partial<TargetPayload>).selector,
+          targetTag: (event.payload as Partial<TargetPayload>).targetTag,
           expected: 'A DOM transition matching the recorded session',
           actual: `DOM unchanged (${after.elements} elements, ${after.textLength} chars of text)`,
         },
@@ -669,10 +675,11 @@ export class Replayer {
   /** O(nodes) with no string allocation, unlike serialising `document.body.innerHTML`. */
   fingerprint(): DomFingerprint {
     const body = document.body;
-    if (!body) return { elements: 0, textLength: 0, structure: 0 };
+    if (!body) return { elements: 0, textLength: 0, structure: 0, attributes: 0 };
 
     let elements = 0;
     let structure = 0;
+    let attributes = 0;
     const walker = document.createTreeWalker(body, NodeFilter.SHOW_ELEMENT);
     let node = walker.nextNode() as Element | null;
     while (node) {
@@ -680,11 +687,15 @@ export class Replayer {
         elements += 1;
         // Cheap order-sensitive rolling hash of the tag sequence.
         structure = (structure * 31 + node.tagName.length + node.childElementCount) >>> 0;
+        // Structure and text alone cannot see a class or state toggle, which is
+        // how most menus, dropdowns and disclosure widgets actually work - so
+        // replay of those looked like "no DOM change at all".
+        attributes = (attributes * 31 + node.attributes.length + hashString(stateSignature(node))) >>> 0;
       }
       node = walker.nextNode() as Element | null;
     }
 
-    return { elements, textLength: (body.textContent ?? '').length, structure };
+    return { elements, textLength: (body.textContent ?? '').length, structure, attributes };
   }
 
   private setupDomStabilityObserver(): void {
@@ -900,7 +911,37 @@ export function clampSpeed(speed: number): number {
 }
 
 export function fingerprintsDiffer(a: DomFingerprint, b: DomFingerprint): boolean {
-  return a.elements !== b.elements || a.textLength !== b.textLength || a.structure !== b.structure;
+  return (
+    a.elements !== b.elements ||
+    a.textLength !== b.textLength ||
+    a.structure !== b.structure ||
+    a.attributes !== b.attributes
+  );
+}
+
+/**
+ * Attributes that carry visible UI state. Menus, dropdowns and disclosure
+ * widgets almost always toggle one of these rather than adding or removing
+ * nodes, so they are what makes an interaction observable.
+ */
+const STATE_ATTRIBUTES = ['class', 'hidden', 'open', 'aria-expanded', 'aria-hidden', 'aria-selected'];
+
+export function stateSignature(el: Element): string {
+  let signature = '';
+  for (const name of STATE_ATTRIBUTES) {
+    const value = el.getAttribute(name);
+    if (value !== null) signature += `${name}=${value};`;
+  }
+  return signature;
+}
+
+/** FNV-style rolling hash: no allocation beyond the signature string itself. */
+export function hashString(value: string): number {
+  let hash = 0;
+  for (let i = 0; i < value.length; i++) {
+    hash = (hash * 31 + value.charCodeAt(i)) >>> 0;
+  }
+  return hash;
 }
 
 export function buildCandidates(target: TargetPayload): string[] {

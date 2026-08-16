@@ -4,8 +4,10 @@ import {
   clampSpeed,
   collectNetworkMocks,
   fingerprintsDiffer,
+  hashString,
   normalizeUrl,
   Replayer,
+  stateSignature,
 } from './replayer';
 import { REPLAYX_UI_ATTR } from './selector';
 import type { RecordedEvent, ReplayErrorEntry } from '../types';
@@ -86,11 +88,13 @@ describe('pure helpers', () => {
   });
 
   it('compares DOM fingerprints structurally', () => {
-    const base = { elements: 5, textLength: 10, structure: 123 };
+    const base = { elements: 5, textLength: 10, structure: 123, attributes: 7 };
     expect(fingerprintsDiffer(base, base)).toBe(false);
     expect(fingerprintsDiffer(base, { ...base, elements: 6 })).toBe(true);
     expect(fingerprintsDiffer(base, { ...base, textLength: 11 })).toBe(true);
     expect(fingerprintsDiffer(base, { ...base, structure: 999 })).toBe(true);
+    // A class toggle changes nothing but this component.
+    expect(fingerprintsDiffer(base, { ...base, attributes: 8 })).toBe(true);
   });
 });
 
@@ -640,5 +644,101 @@ describe('storage restoration', () => {
     // Unrelated user data must survive.
     expect(localStorage.getItem('keep-me')).toBe('yes');
     localStorage.clear();
+  });
+});
+
+describe('attribute-only DOM changes', () => {
+  it('detects a class toggle that changes no elements or text', () => {
+    // Menus, dropdowns and disclosure widgets work this way. Element count,
+    // text length and tag structure are all identical before and after, so the
+    // old fingerprint reported "no observable DOM change" for every one.
+    document.body.innerHTML = '<nav id="menu" class="vector-menu"><a href="#">Item</a></nav>';
+    const before = replayer.fingerprint();
+
+    document.getElementById('menu')!.className = 'vector-menu vector-menu-open';
+    const after = replayer.fingerprint();
+
+    expect(after.elements).toBe(before.elements);
+    expect(after.textLength).toBe(before.textLength);
+    expect(after.structure).toBe(before.structure);
+    expect(fingerprintsDiffer(before, after)).toBe(true);
+  });
+
+  it('detects an aria-expanded toggle', () => {
+    document.body.innerHTML = '<button id="t" aria-expanded="false">Menu</button>';
+    const before = replayer.fingerprint();
+    document.getElementById('t')!.setAttribute('aria-expanded', 'true');
+    expect(fingerprintsDiffer(before, replayer.fingerprint())).toBe(true);
+  });
+
+  it('detects a hidden attribute toggle', () => {
+    document.body.innerHTML = '<div id="panel" hidden>content</div>';
+    const before = replayer.fingerprint();
+    document.getElementById('panel')!.removeAttribute('hidden');
+    expect(fingerprintsDiffer(before, replayer.fingerprint())).toBe(true);
+  });
+
+  it('reports no difference when nothing actually changed', () => {
+    document.body.innerHTML = '<nav id="menu" class="a"><a href="#">Item</a></nav>';
+    expect(fingerprintsDiffer(replayer.fingerprint(), replayer.fingerprint())).toBe(false);
+  });
+
+  it('still ignores ReplayX’s own UI', () => {
+    document.body.innerHTML = '<div id="page" class="a">x</div>';
+    const before = replayer.fingerprint();
+
+    const cursor = document.createElement('div');
+    cursor.setAttribute(REPLAYX_UI_ATTR, 'cursor');
+    cursor.className = 'moving';
+    document.body.appendChild(cursor);
+
+    // Our cursor changes class constantly; counting it would make every settle
+    // look like a DOM change and mask real mismatches.
+    expect(fingerprintsDiffer(before, replayer.fingerprint())).toBe(false);
+  });
+
+  it('names the target element in a mismatch finding', () => {
+    document.body.innerHTML = '<button id="btn">Open</button>';
+    const event = makeEvent({
+      id: 'click',
+      type: 'Click',
+      payload: { selector: '#btn', targetTag: 'button', x: 0, y: 0 },
+    });
+    (internals().eventsExpectingDomChange as Set<string>).add('click');
+
+    return internals()
+      .settle(event, 10, 'interaction')
+      .then(() => {
+        const [issue] = replayer.getErrors();
+        expect(issue).toMatchObject({
+          code: 'dom_mismatch',
+          eventType: 'Click',
+          selector: '#btn',
+          targetTag: 'button',
+        });
+      });
+  });
+});
+
+describe('hashString', () => {
+  it('is stable and distinguishes different inputs', () => {
+    expect(hashString('class=open;')).toBe(hashString('class=open;'));
+    expect(hashString('class=open;')).not.toBe(hashString('class=closed;'));
+    expect(hashString('')).toBe(0);
+  });
+});
+
+describe('stateSignature', () => {
+  it('captures only state-bearing attributes', () => {
+    document.body.innerHTML = '<div id="d" class="a" aria-expanded="true" data-noise="x"></div>';
+    const signature = stateSignature(document.getElementById('d')!);
+    expect(signature).toContain('class=a');
+    expect(signature).toContain('aria-expanded=true');
+    expect(signature).not.toContain('data-noise');
+  });
+
+  it('returns an empty signature for a bare element', () => {
+    document.body.innerHTML = '<div id="d"></div>';
+    expect(stateSignature(document.getElementById('d')!)).toBe('');
   });
 });

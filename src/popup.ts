@@ -262,7 +262,15 @@ function renderDebugger(session: SessionData): void {
     issues.list.append(element('div', { className: 'debugger-empty', text: 'No replay issues recorded.' }));
   } else {
     for (const error of errors.slice(0, 10)) {
-      const meta = [error.severity ?? 'warning', error.stage ?? 'playback', error.code]
+      // The event type and time are what let a reader find the interaction in
+      // the timeline; without them a finding is not actionable.
+      const meta = [
+        error.eventType ? `${error.eventType} event` : '',
+        typeof error.timestamp === 'number' ? `${error.timestamp}ms` : '',
+        error.severity ?? 'warning',
+        error.stage ?? 'playback',
+        error.code,
+      ]
         .filter(Boolean)
         .join(' • ');
       const bodyLines = [
