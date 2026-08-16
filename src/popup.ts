@@ -1,5 +1,5 @@
 import './popup.css';
-import { getEventDetailSummary, getReplayStatusBadge, summarizeEvent } from './debugger';
+import { collapseTimeline, getEventDetailSummary, getReplayStatusBadge, summarizeEvent } from './debugger';
 import type { RuntimeState } from './messages';
 import type { ReplayErrorEntry, SessionData, SessionSummary } from './types';
 import { sanitizeSessionData, validateSessionData } from './validation';
@@ -281,8 +281,23 @@ function renderDebugger(session: SessionData): void {
   if (events.length === 0) {
     timeline.list.append(element('div', { className: 'debugger-empty', text: 'No events captured.' }));
   } else {
-    for (const event of events.slice(0, 25)) {
-      timeline.list.append(detailRow(event.type, `${event.timestamp}ms`, summarizeEvent(event)));
+    // A page load can emit hundreds of DOM mutations in a burst. Rendering them
+    // one per row pushed the interactions that actually matter off the visible
+    // timeline, so consecutive runs are collapsed into a single entry.
+    for (const entry of collapseTimeline(events, 25)) {
+      if (entry.kind === 'run') {
+        timeline.list.append(
+          detailRow(
+            `${entry.count} DOM mutations`,
+            `${entry.from}ms – ${entry.to}ms`,
+            'Collapsed: page-driven DOM churn between interactions.',
+          ),
+        );
+      } else {
+        timeline.list.append(
+          detailRow(entry.event.type, `${entry.event.timestamp}ms`, summarizeEvent(entry.event)),
+        );
+      }
     }
   }
 

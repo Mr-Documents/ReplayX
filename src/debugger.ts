@@ -2,9 +2,12 @@ import type {
   ChangePayload,
   ClickPayload,
   InputPayload,
+  KeyPayload,
+  MutationPayload,
   NavigationPayload,
   NetworkPayload,
   RecordedEvent,
+  ResizePayload,
   ScrollPayload,
   SessionData,
   SubmitPayload,
@@ -102,19 +105,144 @@ export function getEventDetailSummary(event: RecordedEvent): EventDetail {
       };
     }
 
-    default: {
-      const payload = event.payload as Partial<TargetPayload>;
+    case 'Mutation': {
+      // Mutation payloads key the target as `targetSelector`, so the generic
+      // `payload.selector` fallback could never describe one - every DOM
+      // mutation rendered as "No additional detail".
+      const payload = event.payload as MutationPayload;
+      const added = payload.addedNodes?.length ?? 0;
+      const removed = payload.removedNodes?.length ?? 0;
+
+      let meta: string;
+      if (payload.type === 'attributes') {
+        meta = `${payload.attributeName || 'attribute'} changed`;
+      } else if (payload.type === 'characterData') {
+        meta = 'text changed';
+      } else {
+        meta = [added ? `+${added} node${added === 1 ? '' : 's'}` : '', removed ? `-${removed}` : '']
+          .filter(Boolean)
+          .join(' ') || 'no net change';
+      }
+
       return {
-        title: event.type,
-        meta: payload.selector ? `Target: ${payload.selector}` : 'No additional detail',
+        title: `Mutation (${payload.type})`,
+        meta: `${payload.targetSelector || 'unknown target'} — ${meta}`,
+        body: describeMutationChange(payload),
+      };
+    }
+
+    case 'Key': {
+      const payload = event.payload as KeyPayload;
+      const modifiers = [
+        payload.ctrlKey ? 'Ctrl' : '',
+        payload.altKey ? 'Alt' : '',
+        payload.shiftKey ? 'Shift' : '',
+        payload.metaKey ? 'Meta' : '',
+      ].filter(Boolean);
+      const combo = [...modifiers, payload.key].join('+');
+      return {
+        title: `Key ${payload.kind === 'up' ? 'up' : 'down'}`,
+        meta: combo || 'unknown key',
+        body: payload.code ? `Code: ${payload.code}` : '',
+      };
+    }
+
+    case 'Resize': {
+      const payload = event.payload as ResizePayload;
+      return {
+        title: 'Resize',
+        meta: `${payload.width} x ${payload.height}`,
+        body: '',
+      };
+    }
+
+    case 'Focus':
+    case 'Blur': {
+      const payload = event.payload as TargetPayload;
+      return {
+        title: `${event.type} ${payload.selector || 'unknown'}`,
+        meta: payload.targetTag ? `<${payload.targetTag}>` : 'No target tag recorded',
+        body: '',
+      };
+    }
+
+    default: {
+      // Every known event type is handled above, so `event` narrows to never.
+      // This branch only catches data written by a future or older build.
+      const unknown = event as RecordedEvent;
+      const payload = unknown.payload as Partial<TargetPayload>;
+      return {
+        title: String(unknown.type),
+        meta: payload?.selector ? `Target: ${payload.selector}` : 'No additional detail',
         body: '',
       };
     }
   }
 }
 
+function describeMutationChange(payload: MutationPayload): string {
+  if (payload.type === 'attributes') {
+    return `${payload.oldValue ? `was: ${truncate(payload.oldValue, 60)}\n` : ''}now: ${truncate(
+      payload.attributeValue,
+      60,
+    )}`;
+  }
+  if (payload.type === 'characterData') {
+    return `${payload.oldValue ? `was: ${truncate(payload.oldValue, 60)}\n` : ''}now: ${truncate(
+      payload.newValue,
+      60,
+    )}`;
+  }
+  const first = payload.addedNodes?.[0] ?? payload.removedNodes?.[0];
+  return first ? truncate(first, 100) : '';
+}
+
 /** One-line description used in the popup event timeline. */
 export function summarizeEvent(event: RecordedEvent): string {
   const detail = getEventDetailSummary(event);
   return [detail.meta, detail.body].filter(Boolean).join(' — ');
+}
+
+export type TimelineEntry =
+  | { kind: 'event'; event: RecordedEvent }
+  | { kind: 'run'; count: number; from: number; to: number };
+
+/**
+ * Collapses consecutive DOM mutations into a single entry.
+ *
+ * A page load can emit hundreds of mutations in a burst; listed individually
+ * they push the clicks and inputs the user is actually looking for off the end
+ * of the timeline. Runs are only collapsed when there are at least two in a
+ * row, so an isolated mutation is still shown in full.
+ */
+export function collapseTimeline(events: readonly RecordedEvent[], limit = 25): TimelineEntry[] {
+  const entries: TimelineEntry[] = [];
+
+  for (let i = 0; i < events.length && entries.length < limit; i++) {
+    const event = events[i];
+    if (!event) continue;
+
+    if (event.type !== 'Mutation') {
+      entries.push({ kind: 'event', event });
+      continue;
+    }
+
+    let end = i;
+    while (end + 1 < events.length && events[end + 1]?.type === 'Mutation') end += 1;
+
+    const count = end - i + 1;
+    if (count === 1) {
+      entries.push({ kind: 'event', event });
+    } else {
+      entries.push({
+        kind: 'run',
+        count,
+        from: event.timestamp,
+        to: events[end]?.timestamp ?? event.timestamp,
+      });
+    }
+    i = end;
+  }
+
+  return entries;
 }
